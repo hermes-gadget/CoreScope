@@ -187,3 +187,34 @@ cmd/ingestor/
   util.go          — shared utilities
   go.mod / go.sum  — Go module definition
 ```
+
+## Redis live source (ukmesh RAM-first ingest)
+
+`redisSources[]` follows the *pending* entries of a ukmesh RAM-first ingest
+stream (`MQTT_INGEST_MODE=ram` upstream): validated packets are admitted to a
+bounded Redis stream at broker-acknowledgement time and persisted to
+PostgreSQL moments later, so following the stream makes new observations
+visible to CoreScope without waiting for the database flush window.
+
+- Entries are read with plain XRANGE — readers never consume entries away from
+  the upstream writer and never race other consumers.
+- The `postgresSources` follow continues to deliver the same observations from
+  the database; the observation upsert collapses the duplicate, and the later
+  database copy carries the fuller payload. Down / unconfigured live source
+  loses nothing — the database follow remains the completeness path.
+- `requirePublicVisibility` (default true) filters to entries the upstream
+  classified as publicly visible at admission.
+- Cursor (last stream ID) persists next to the config as
+  `redis-source-<name>.state.json`; a restart resumes without replay.
+
+```json
+"redisSources": [
+  {
+    "name": "ukmesh-live",
+    "url": "redis://:password@redis:6379",
+    "pollIntervalMs": 500,
+    "batchSize": 500,
+    "requirePublicVisibility": true
+  }
+]
+```

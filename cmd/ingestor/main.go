@@ -260,12 +260,12 @@ func main() {
 	// clients are retrying in background (tracked in clients) but don't count
 	// as "connected" — a single unreachable broker must not silently run with
 	// zero active connections.
-	if connectedCount == 0 && len(cfg.PostgresSources) == 0 {
+	if connectedCount == 0 && len(cfg.PostgresSources) == 0 && len(cfg.RedisSources) == 0 {
 		// Clean up any timed-out clients still retrying
 		for _, c := range clients {
 			c.Disconnect(0)
 		}
-		log.Fatal("no sources connected — all MQTT sources timed out or failed and no postgresSources are configured. Check the broker (default: mqtt://localhost:1883) or configure mqttSources/postgresSources in config.json")
+		log.Fatal("no sources connected — all MQTT sources timed out or failed and no postgresSources are configured. Check the broker (default: mqtt://localhost:1883) or configure mqttSources/postgresSources/redisSources in config.json")
 	}
 
 	if connectedCount < len(clients) {
@@ -284,6 +284,19 @@ func main() {
 	}
 	if len(cfg.PostgresSources) > 0 {
 		log.Printf("Running — %d postgres source(s) starting", len(cfg.PostgresSources))
+	}
+
+	// Redis sources: follow the pending entries of a ukmesh RAM-first ingest
+	// stream — a live fast-path that makes new observations visible before
+	// the database flush window; the postgres follow still delivers the same
+	// observations from the database and the observation upsert collapses
+	// the duplicate. Each runs in its own goroutine with a persisted cursor.
+	for _, rsrc := range cfg.RedisSources {
+		rs := rsrc
+		go runRedisSource(store, rs, keySet, regionSet, cfg, ingestBuffer, filepath.Dir(*configPath))
+	}
+	if len(cfg.RedisSources) > 0 {
+		log.Printf("Running — %d redis source(s) starting", len(cfg.RedisSources))
 	}
 
 	// Node retention: move stale nodes to inactive_nodes on startup

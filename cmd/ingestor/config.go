@@ -100,6 +100,69 @@ func (p PostgresSource) PublicVisibilityRequired() bool {
 	return p.RequirePublicVisibility == nil || *p.RequirePublicVisibility
 }
 
+// RedisSource reads pending (not-yet-committed) packet observations from a
+// ukmesh RAM-first ingest stream — the live fast-path ahead of the
+// postgresSources database follow (see redis_source.go).
+type RedisSource struct {
+	Name string `json:"name"`
+	// URL is a redis:// connection URL, e.g. redis://:password@redis:6379.
+	URL string `json:"url"`
+	// Password overrides the password embedded in URL when set.
+	Password string `json:"password,omitempty"`
+	// StreamKey is the stream name (default meshcore:ingest:pending).
+	StreamKey string `json:"streamKey,omitempty"`
+	// PollIntervalMs is the delay between polls for new entries (default 500).
+	PollIntervalMs int `json:"pollIntervalMs,omitempty"`
+	// BatchSize is entries read per poll (default 500).
+	BatchSize int `json:"batchSize,omitempty"`
+	// Networks restricts entries to matching network values (empty = all).
+	Networks []string `json:"networks,omitempty"`
+	// RequirePublicVisibility (default true) filters to entries the upstream
+	// classified as publicly visible at admission. Disable only for private
+	// deployments.
+	RequirePublicVisibility *bool `json:"requirePublicVisibility,omitempty"`
+	// MaxEnvelopePastDays overrides the 30-day past clamp applied to envelope
+	// timestamps for this source (0 = default, <0 = no clamp).
+	MaxEnvelopePastDays int `json:"maxEnvelopePastDays,omitempty"`
+	// StatePath overrides where the cursor is persisted (default:
+	// redis-source-<name>.state.json next to the config file).
+	StatePath string `json:"statePath,omitempty"`
+	// MaxRowsPerSec throttles ingest (0 = unlimited).
+	MaxRowsPerSec int `json:"maxRowsPerSec,omitempty"`
+}
+
+// PollIntervalMsOrDefault returns the per-source poll interval in
+// milliseconds, or 500 if not set.
+func (r RedisSource) PollIntervalMsOrDefault() int {
+	if r.PollIntervalMs > 0 {
+		return r.PollIntervalMs
+	}
+	return 500
+}
+
+// BatchSizeOrDefault returns entries fetched per read, or 500 if not set.
+func (r RedisSource) BatchSizeOrDefault() int {
+	if r.BatchSize > 0 {
+		return r.BatchSize
+	}
+	return 500
+}
+
+// StreamKeyOrDefault returns the stream name, or the ukmesh RAM ingest
+// default if not set.
+func (r RedisSource) StreamKeyOrDefault() string {
+	if r.StreamKey != "" {
+		return r.StreamKey
+	}
+	return "meshcore:ingest:pending"
+}
+
+// PublicVisibilityRequired reports whether the public-read guard applies
+// (default true).
+func (r RedisSource) PublicVisibilityRequired() bool {
+	return r.RequirePublicVisibility == nil || *r.RequirePublicVisibility
+}
+
 // ConnectTimeoutOrDefault returns the per-source connect timeout in seconds,
 // or 30 if not set (matching the WaitTimeout default from #926).
 func (s MQTTSource) ConnectTimeoutOrDefault() int {
@@ -123,6 +186,9 @@ type Config struct {
 	// PostgresSources read packets from an existing meshcore PostgreSQL /
 	// TimescaleDB deployment (backfill + follow) — see postgres_source.go.
 	PostgresSources      []PostgresSource            `json:"postgresSources,omitempty"`
+	// RedisSources read pending observations from a ukmesh RAM-first ingest
+	// stream (live fast-path ahead of the postgres follow) — see redis_source.go.
+	RedisSources         []RedisSource               `json:"redisSources,omitempty"`
 	LogLevel             string                      `json:"logLevel,omitempty"`
 	ChannelKeysPath      string                      `json:"channelKeysPath,omitempty"`
 	ChannelKeys          map[string]string           `json:"channelKeys,omitempty"`
