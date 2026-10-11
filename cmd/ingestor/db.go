@@ -500,7 +500,18 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		err = tx.Stmt(s.stmtGetObserverRowid).QueryRow(data.ObserverID).Scan(&id)
 		if err == nil {
 			observerIdx = &id
-			_, err = tx.Stmt(s.stmtUpdateObserverLastSeen).Exec(ingestNow, ingestNow, ingestNow, ingestNow, id)
+			// observer.last_seen and last_packet_at answer "when did the analyzer
+			// last hear from this observer". For live sources that is ingest
+			// time (#1465). Historical sources (data.PreserveTime) use the
+			// stored rxTime as the monotonic floor so a backfill advances
+			// observers through history instead of pinning them to the replay
+			// run; the MAX/MIN guard never lets either value move backwards
+			// or into the future.
+			obsFloor := ingestNow
+			if data.PreserveTime {
+				obsFloor = rxTime
+			}
+			_, err = tx.Stmt(s.stmtUpdateObserverLastSeen).Exec(ingestNow, obsFloor, ingestNow, obsFloor, id)
 		}
 		if err != nil && err != sql.ErrNoRows {
 			return false, err
@@ -1377,6 +1388,7 @@ type PacketData struct {
 	Region            string // observer region: payload > topic > source config (#788)
 	Foreign           bool   // true when ADVERT GPS lies outside configured geofilter (#730)
 	FromPubkey        string // pubkey of the originating node, for exact-match attribution (#1143)
+	PreserveTime      bool   // store Timestamp as packet/observation time (historical sources)
 }
 
 // nilIfEmpty returns nil for empty strings (for nullable DB columns).
@@ -1588,6 +1600,11 @@ type MQTTPacketMessage struct {
 	Origin    string   `json:"origin"`
 	Region    string   `json:"region,omitempty"`    // optional region override (#788)
 	Timestamp string   `json:"timestamp,omitempty"` // observer receive time, resolved by handler
+	// PreserveTime stores Timestamp as the packet/observation time instead
+	// of the server ingest clock (#1370). Set by the handler from the
+	// source config (historical sources such as PostgresSource backfills);
+	// not parsed from the JSON envelope.
+	PreserveTime bool `json:"-"`
 }
 
 // BuildPacketData constructs a PacketData from a decoded packet and MQTT message.
@@ -1620,9 +1637,18 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		pathJSON = string(b)
 	}
 
+	// #1370 (counters #1233): live sources stamp server ingest time. A
+	// historical source (PreserveEnvelopeTime) keeps the resolved envelope
+	// time instead — stamping replayed history with the replay wall clock
+	// would collapse weeks of backfill onto one day.
+	pktTime := time.Now().UTC().Format(time.RFC3339)
+	if msg.PreserveTime && msg.Timestamp != "" {
+		pktTime = msg.Timestamp
+	}
+
 	pd := &PacketData{
 		RawHex:         msg.Raw,
-		Timestamp:      time.Now().UTC().Format(time.RFC3339), // #1370 (counters #1233)
+		Timestamp:      pktTime,
 		ObserverID:     observerID,
 		ObserverName:   msg.Origin,
 		SNR:            msg.SNR,
@@ -1635,6 +1661,7 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		PayloadVersion: decoded.Header.PayloadVersion,
 		PathJSON:       pathJSON,
 		DecodedJSON:    PayloadJSON(&decoded.Payload),
+		PreserveTime:   msg.PreserveTime,
 	}
 
 	// Region priority: payload field > topic-derived parameter (#788)

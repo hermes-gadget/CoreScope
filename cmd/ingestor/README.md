@@ -96,6 +96,48 @@ The ingestor reads these fields from the existing `config.json`:
 - `mqtt` — legacy single-broker config (auto-converted to `mqttSources`)
 - `databaseURL` — restricted telemetry writer URL; schema-owner credentials are refused
 - `stateDir` — local queue/statistics directory (default: `data`)
+- `dbPath` — SQLite DB path (default: `data/meshcore.db`)
+- `postgresSources[]` — read packets from an existing meshcore
+  PostgreSQL/TimescaleDB deployment (backfill + follow); see below
+
+### Postgres source (backfill + follow)
+
+Optional. Reads MeshCore packets from an existing PostgreSQL/TimescaleDB
+deployment that stores one row per observer reception (the meshcore
+analytics `packets` schema) and replays them through the same ingest
+pipeline as MQTT traffic. Use it to seed a new analyzer from an existing
+deployment's history and/or to keep it fed from the database instead of
+the broker:
+
+```json
+"postgresSources": [
+  {
+    "name": "meshcore-db",
+    "dsn": "postgres://meshcore:password@timescaledb:5432/meshcore?sslmode=disable",
+    "startTime": "2026-09-10T00:00:00Z",
+    "pollIntervalSec": 5,
+    "batchSize": 500,
+    "maxRowsPerSec": 0,
+    "networks": ["ukmesh"],
+    "maxEnvelopePastDays": -1,
+    "requirePublicVisibility": true
+  }
+]
+```
+
+- `startTime` (RFC3339) begins a one-time backfill when no cursor exists
+  yet; empty = only new rows. The cursor is persisted next to the config
+  (`pg-source-<name>.state.json`) after every fully-drained batch, so a
+  restart resumes exactly where it left off.
+- `maxEnvelopePastDays` overrides the 30-day envelope past-clamp for this
+  source (`-1` = no clamp) so historical rows keep their original times.
+- `requirePublicVisibility` (default true) applies the public-read guard:
+  `visibility_ok IS TRUE AND is_private IS NOT TRUE`.
+- `networks` restricts to `packets.network` values (empty = all).
+- The source paces itself on the ingest buffer and never advances its
+  cursor past rows that have not drained, so backfills cannot silently
+  lose history.
+>>>>>>> 73f2baf0 (feat(ingestor): add Postgres source for backfill + follow)
 
 ## Test
 

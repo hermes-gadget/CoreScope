@@ -28,6 +28,75 @@ type MQTTSource struct {
 	Region             string   `json:"region,omitempty"`
 	// ClientID is the MQTT ClientID; empty means corescope-<name>-<random>.
 	ClientID string `json:"clientId,omitempty"`
+
+	// PreserveEnvelopeTime stores the envelope timestamp as the packet and
+	// observation time instead of the server ingest clock (#1370). Set for
+	// historical sources (database backfills): without it, replayed history
+	// is stamped with the replay run's wall clock.
+	PreserveEnvelopeTime bool `json:"preserveEnvelopeTime,omitempty"`
+	// MaxEnvelopePastDays overrides the default 30-day past clamp applied
+	// to envelope timestamps (only consulted with PreserveEnvelopeTime).
+	// 0 = default; <0 = no past clamp.
+	MaxEnvelopePastDays int `json:"maxEnvelopePastDays,omitempty"`
+}
+
+// PostgresSource reads MeshCore packets from an existing PostgreSQL /
+// TimescaleDB deployment (the meshcore analytics schema: one row per
+// observer reception in the `packets` table) and feeds them through the
+// standard ingest pipeline. Supports a one-time historical backfill
+// (startTime) followed by continuous polling for new rows. See
+// postgres_source.go.
+type PostgresSource struct {
+	Name string `json:"name"`
+	// DSN is a libpq connection string, e.g.
+	// postgres://user:pass@host:5432/meshcore?sslmode=disable
+	DSN string `json:"dsn"`
+	// StartTime (RFC3339) is where an initial backfill begins when no
+	// cursor state exists yet. Empty = start from now (no backfill).
+	StartTime string `json:"startTime,omitempty"`
+	// PollIntervalSec is the delay between polls for new rows (default 5).
+	PollIntervalSec int `json:"pollIntervalSec,omitempty"`
+	// BatchSize is the rows per query (default 500).
+	BatchSize int `json:"batchSize,omitempty"`
+	// MaxRowsPerSec throttles ingest (0 = unlimited) — protects small hosts
+	// during large backfills.
+	MaxRowsPerSec int `json:"maxRowsPerSec,omitempty"`
+	// Networks restricts to packets.network values (empty = all networks).
+	Networks []string `json:"networks,omitempty"`
+	// RequirePublicVisibility (default true) applies the public-read guard:
+	// visibility_ok IS TRUE AND is_private IS NOT TRUE. Disable only for
+	// private deployments.
+	RequirePublicVisibility *bool `json:"requirePublicVisibility,omitempty"`
+	// MaxEnvelopePastDays overrides the 30-day past clamp applied to
+	// envelope timestamps for this source (0 = default, <0 = no clamp).
+	// Backfills older than 30 days need this.
+	MaxEnvelopePastDays int `json:"maxEnvelopePastDays,omitempty"`
+	// StatePath overrides where the cursor is persisted (default:
+	// pg-source-<name>.state.json next to the config file).
+	StatePath string `json:"statePath,omitempty"`
+}
+
+// PollIntervalOrDefault returns the per-source poll interval in seconds,
+// or 5 if not set.
+func (p PostgresSource) PollIntervalOrDefault() int {
+	if p.PollIntervalSec > 0 {
+		return p.PollIntervalSec
+	}
+	return 5
+}
+
+// BatchSizeOrDefault returns the rows fetched per query, or 500 if not set.
+func (p PostgresSource) BatchSizeOrDefault() int {
+	if p.BatchSize > 0 {
+		return p.BatchSize
+	}
+	return 500
+}
+
+// PublicVisibilityRequired reports whether the public-read guard applies
+// (default true).
+func (p PostgresSource) PublicVisibilityRequired() bool {
+	return p.RequirePublicVisibility == nil || *p.RequirePublicVisibility
 }
 
 // ConnectTimeoutOrDefault returns the per-source connect timeout in seconds,
@@ -52,6 +121,9 @@ type Config struct {
 	DBPath               string                      `json:"dbPath"`
 	MQTT                 *MQTTLegacy                 `json:"mqtt,omitempty"`
 	MQTTSources          []MQTTSource                `json:"mqttSources,omitempty"`
+	// PostgresSources read packets from an existing meshcore PostgreSQL /
+	// TimescaleDB deployment (backfill + follow) — see postgres_source.go.
+	PostgresSources      []PostgresSource            `json:"postgresSources,omitempty"`
 	LogLevel             string                      `json:"logLevel,omitempty"`
 	ChannelKeysPath      string                      `json:"channelKeysPath,omitempty"`
 	ChannelKeys          map[string]string           `json:"channelKeys,omitempty"`
