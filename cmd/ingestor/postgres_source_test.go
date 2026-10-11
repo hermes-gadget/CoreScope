@@ -47,7 +47,7 @@ func TestBuildPgBatchQuery(t *testing.T) {
 
 	t.Run("defaults: public guard, no network filter", func(t *testing.T) {
 		q, args := buildPgBatchQuery(PostgresSource{Name: "x"}, cursor, 500)
-		if !strings.Contains(q, "visibility_ok IS TRUE") || !strings.Contains(q, "is_private IS NOT TRUE") {
+		if !strings.Contains(q, "meshcore_path_matches_private") || !strings.Contains(q, "visibility_generation = current_visibility.generation") {
 			t.Errorf("public guard missing:\n%s", q)
 		}
 		if strings.Contains(q, "= ANY(") {
@@ -71,13 +71,37 @@ func TestBuildPgBatchQuery(t *testing.T) {
 		if !strings.Contains(q, "= ANY($3)") || !strings.Contains(q, "LIMIT $4") {
 			t.Errorf("placeholders wrong:\n%s", q)
 		}
-		if strings.Contains(q, "visibility_ok") {
+		if strings.Contains(q, "meshcore_path_matches_private") {
 			t.Errorf("guard should be off:\n%s", q)
 		}
 		if len(args) != 4 {
 			t.Fatalf("args = %d, want 4", len(args))
 		}
 	})
+}
+
+func TestF07LedgerCursorUsesCommitOrderRatherThanObservedTime(t *testing.T) {
+	cursor := pgSourceState{LastTime: "2026-10-11T17:05:00Z", LastObsID: pgZeroObsID, LastSeq: 42}
+	q, args := buildPgLedgerBatchQuery(PostgresSource{Networks: []string{"ukmesh"}}, cursor, 100)
+	for _, want := range []string{"FROM ingest_observation_ledger l", "l.seq > $1", "ORDER BY l.seq", "l.observation_id::text"} {
+		if !strings.Contains(q, want) {
+			t.Fatalf("ledger query missing %q: %s", want, q)
+		}
+	}
+	if strings.Contains(q, "p.time >") || strings.Contains(q, "p.time,") && strings.Contains(q, "WHERE (p.time") {
+		t.Fatalf("admission time must not gate a later commit: %s", q)
+	}
+	if args[0] != int64(42) || args[len(args)-1] != 100 {
+		t.Fatalf("ledger cursor args = %v", args)
+	}
+	statePath := filepath.Join(t.TempDir(), "cursor.json")
+	if err := savePgSourceState(statePath, pgSourceState{LastSeq: 43}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := loadPgSourceState(statePath)
+	if !ok || got.LastSeq != 43 {
+		t.Fatalf("seq-only cursor not restored: %+v, %v", got, ok)
+	}
 }
 
 func TestPgEnvelopeMarshal(t *testing.T) {

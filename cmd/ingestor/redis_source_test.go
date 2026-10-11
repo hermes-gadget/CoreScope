@@ -68,10 +68,10 @@ func TestRedisEntryAllowedFilters(t *testing.T) {
 	publicEntry := redisPendingEntry{network: "ukmesh", visibilityOK: true}
 	otherNet := redisPendingEntry{network: "teesside", visibilityOK: true}
 
-	// Default: requirePublicVisibility defaults true.
+	// Scope matching is independent of the frozen admission visibility bit.
 	srcDefault := RedisSource{}
-	if redisEntryAllowed(privateEntry, srcDefault) {
-		t.Fatal("private entry must be rejected under default visibility guard")
+	if !redisEntryAllowed(privateEntry, srcDefault) {
+		t.Fatal("admission visibility is not current authorization")
 	}
 	if !redisEntryAllowed(publicEntry, srcDefault) {
 		t.Fatal("public entry must pass default guard")
@@ -94,6 +94,40 @@ func TestRedisEntryAllowedFilters(t *testing.T) {
 	srcScopedOpen := RedisSource{Networks: []string{"ukmesh", "teesside"}, RequirePublicVisibility: &noGuard}
 	if !redisEntryAllowed(otherNet, srcScopedOpen) {
 		t.Fatal("multi-network scope must include listed networks")
+	}
+}
+
+func TestF01CorePublicPolicyOverridesFrozenRedisVisibility(t *testing.T) {
+	public := &corePublicPolicy{}
+	e := redisPendingEntry{network: "northeast", rxNodeID: "AABB", visibilityOK: false,
+		pathHashes: []string{"BEEF"}, pathHashSizeBytes: 2}
+	if !public.allows(e) {
+		t.Fatal("a now-public entry must pass even when its admission bit was false")
+	}
+	privateObserver := &corePublicPolicy{prefixes: []corePrivatePrefix{{NodeID: "AABB", Network: "ukmesh"}}}
+	if privateObserver.allows(e) {
+		t.Fatal("current observer privacy must override vo=1")
+	}
+	privatePath := &corePublicPolicy{prefixes: []corePrivatePrefix{{Prefix: "BEEF", Size: 2, Network: "teesside"}}}
+	if privatePath.allows(e) {
+		t.Fatal("current path privacy must match family scope")
+	}
+	if (&corePublicPolicy{}).allows(redisPendingEntry{network: "ukmesh", pathHashes: []string{"GG"}, pathHashSizeBytes: 1}) {
+		t.Fatal("invalid path cannot become public")
+	}
+	if (*corePublicPolicy)(nil).allows(e) {
+		t.Fatal("missing authority must fail closed")
+	}
+}
+
+func TestF07RedisTailRequiresPairedCompletenessSource(t *testing.T) {
+	cfg := &Config{RedisSources: []RedisSource{{Name: "live"}}}
+	if err := cfg.ValidateCompanionSources(); err == nil {
+		t.Fatal("tail-only Redis source must be rejected")
+	}
+	cfg.PostgresSources = []PostgresSource{{Name: "complete", DSN: "postgres://fixture"}}
+	if err := cfg.ValidateCompanionSources(); err != nil {
+		t.Fatalf("paired source rejected: %v", err)
 	}
 }
 

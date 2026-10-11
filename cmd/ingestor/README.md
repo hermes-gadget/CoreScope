@@ -122,14 +122,17 @@ the broker:
 ]
 ```
 
-- `startTime` (RFC3339) begins a one-time backfill when no cursor exists
-  yet; empty = only new rows. The cursor is persisted next to the config
-  (`pg-source-<name>.state.json`) after every fully-drained batch, so a
-  restart resumes exactly where it left off.
+- `startTime` (RFC3339) begins a one-time backfill for a legacy UKMesh
+  database without `ingest_observation_ledger`; empty = only new rows.
+  With migration 058, the committed-sequence cursor starts at zero and
+  follows ledger rows; pre-ledger packets need a separate historical backfill.
+  The cursor is persisted next to the config (`pg-source-<name>.state.json`)
+  after every fully-drained batch, so a restart resumes from that point.
 - `maxEnvelopePastDays` overrides the 30-day envelope past-clamp for this
   source (`-1` = no clamp) so historical rows keep their original times.
-- `requirePublicVisibility` (default true) applies the public-read guard:
-  `visibility_ok IS TRUE AND is_private IS NOT TRUE`.
+- `requirePublicVisibility` (default true) applies the current UKMesh
+  observer/source/path policy and generation/rematerialization fence. Frozen
+  packet visibility flags do not grant access.
 - `networks` restricts to `packets.network` values (empty = all).
 - The source paces itself on the ingest buffer and never advances its
   cursor past rows that have not drained, so backfills cannot silently
@@ -198,12 +201,22 @@ visible to CoreScope without waiting for the database flush window.
 
 - Entries are read with plain XRANGE — readers never consume entries away from
   the upstream writer and never race other consumers.
-- The `postgresSources` follow continues to deliver the same observations from
-  the database; the observation upsert collapses the duplicate, and the later
-  database copy carries the fuller payload. Down / unconfigured live source
-  loses nothing — the database follow remains the completeness path.
-- `requirePublicVisibility` (default true) filters to entries the upstream
-  classified as publicly visible at admission.
+- Exactly one paired `postgresSources` follower is required. Against a UKMesh
+  database with `ingest_observation_ledger` (migration 058), it follows the
+  committed sequence rather than packet receive time, so late commits remain
+  discoverable after the Redis overlap expires. Redis-only configuration is
+  rejected; a missing ledger disables the paired live source.
+- Both sources carry the upstream observation UUID into SQLite. Duplicate
+  Redis/PG deliveries enrich the same row and increment observer packet counts
+  once. Distinct upstream UUIDs remain distinct even with identical frame,
+  observer and path values.
+- `requirePublicVisibility` (default true) checks current UKMesh
+  observer/source/path policy and its materialization fence per batch. Set
+  `privacyDsn` on the Redis source if it differs from the paired PG DSN.
+  Admission-time `vo` is not treated as current permission. Already copied
+  CoreScope derived data still needs an explicit revocation/rebuild path after
+  an upstream public-to-private policy change; do not treat this integration
+  as a fully authorized public mirror until that path is in place.
 - Cursor (last stream ID) persists next to the config as
   `redis-source-<name>.state.json`; a restart resumes without replay.
 

@@ -6,8 +6,8 @@ package main
 //
 // The upstream RAM-first ingest admits validated packets to a bounded Redis
 // stream and acknowledges the broker at admission; a background writer
-// persists batches to PostgreSQL moments later and removes each entry as it
-// commits (commit markers are written as an explicit boundary). This source
+// persists batches to PostgreSQL moments later and retains committed entries
+// for a bounded reader overlap. This source
 // is the live FAST-PATH on top of that: it makes new observations visible to
 // CoreScope without waiting for the database flush window.
 //
@@ -15,19 +15,17 @@ package main
 //   - entries are read with plain XRANGE (no consumer group): readers must
 //     never consume entries away from the upstream writer/other readers, and
 //     re-reading is harmless;
-//   - the postgresSources follow continues to deliver the same observations
-//     from the database later; CoreScope's observation upsert
-//     (transmission_id, observer, path) collapses the live.copy into the
-//     same row, and the later database copy wins with the fuller payload;
-//   - nothing is lost when this source is down: the database follow remains
-//     the completeness path. The cursor only skips live delivery, never data;
-//   - privacy: the upstream entries carry admission-time visibility flags;
-//     with requirePublicVisibility (default true) only visibility_ok entries
-//     are fed — the same guard the postgres source applies to stored rows.
+//   - the paired postgresSources follower uses a committed-order ledger after
+//     Redis retention; stable upstream UUIDs collapse duplicate delivery;
+//   - public batches load current UKMesh policy. Admission-time visibility
+//     flags are metadata, never current authorization.
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -93,15 +91,20 @@ func defaultRedisStatePath(configDir, name string) string {
 // redisPendingEntry is the decoded subset of an upstream stream entry this
 // source needs to build an ingest envelope.
 type redisPendingEntry struct {
-	time         string
-	topic        string
-	network      string
-	rawHex       string
-	packetHash   string
-	snr          *float64
-	rssi         *float64
-	direction    string
-	visibilityOK bool
+	observationID     string
+	time              string
+	topic             string
+	network           string
+	rawHex            string
+	packetHash        string
+	rxNodeID          string
+	srcNodeID         string
+	pathHashes        []string
+	pathHashSizeBytes int
+	snr               *float64
+	rssi              *float64
+	direction         string
+	visibilityOK      bool
 }
 
 // decodeRedisStreamValue parses one stream value in the upstream v1 wire
@@ -112,6 +115,7 @@ func decodeRedisStreamValue(value string) (redisPendingEntry, bool) {
 	var v struct {
 		V  int             `json:"v"`
 		K  string          `json:"k"`
+		O  string          `json:"o"`
 		VO int             `json:"vo"`
 		D  json.RawMessage `json:"d"`
 	}
@@ -122,14 +126,18 @@ func decodeRedisStreamValue(value string) (redisPendingEntry, bool) {
 		return redisPendingEntry{}, false
 	}
 	var d struct {
-		Time        string   `json:"time"`
-		PacketHash  string   `json:"packetHash"`
-		Topic       string   `json:"topic"`
-		Network     string   `json:"network"`
-		RawHex      string   `json:"rawHex"`
-		SNR         *float64 `json:"snr"`
-		RSSI        *float64 `json:"rssi"`
-		PayloadJSON *string  `json:"payloadJson"`
+		Time              string   `json:"time"`
+		PacketHash        string   `json:"packetHash"`
+		Topic             string   `json:"topic"`
+		Network           string   `json:"network"`
+		RawHex            string   `json:"rawHex"`
+		RXNodeID          string   `json:"rxNodeId"`
+		SrcNodeID         string   `json:"srcNodeId"`
+		PathHashes        []string `json:"pathHashes"`
+		PathHashSizeBytes *int     `json:"pathHashSizeBytes"`
+		SNR               *float64 `json:"snr"`
+		RSSI              *float64 `json:"rssi"`
+		PayloadJSON       *string  `json:"payloadJson"`
 	}
 	if err := json.Unmarshal(v.D, &d); err != nil {
 		return redisPendingEntry{}, false
@@ -138,14 +146,21 @@ func decodeRedisStreamValue(value string) (redisPendingEntry, bool) {
 		return redisPendingEntry{}, false
 	}
 	entry := redisPendingEntry{
-		time:         d.Time,
-		topic:        d.Topic,
-		network:      d.Network,
-		rawHex:       d.RawHex,
-		packetHash:   d.PacketHash,
-		snr:          d.SNR,
-		rssi:         d.RSSI,
-		visibilityOK: v.VO == 1,
+		observationID: v.O,
+		time:          d.Time,
+		topic:         d.Topic,
+		network:       d.Network,
+		rawHex:        d.RawHex,
+		packetHash:    d.PacketHash,
+		rxNodeID:      d.RXNodeID,
+		srcNodeID:     d.SrcNodeID,
+		pathHashes:    d.PathHashes,
+		snr:           d.SNR,
+		rssi:          d.RSSI,
+		visibilityOK:  v.VO == 1,
+	}
+	if d.PathHashSizeBytes != nil {
+		entry.pathHashSizeBytes = *d.PathHashSizeBytes
 	}
 	if d.PayloadJSON != nil && *d.PayloadJSON != "" {
 		var pj struct {
@@ -160,9 +175,6 @@ func decodeRedisStreamValue(value string) (redisPendingEntry, bool) {
 
 // redisEntryAllowed applies the source's scope filters to a decoded entry.
 func redisEntryAllowed(e redisPendingEntry, src RedisSource) bool {
-	if src.PublicVisibilityRequired() && !e.visibilityOK {
-		return false
-	}
 	if len(src.Networks) > 0 {
 		for _, n := range src.Networks {
 			if n == e.network {
@@ -170,6 +182,109 @@ func redisEntryAllowed(e redisPendingEntry, src RedisSource) bool {
 			}
 		}
 		return false
+	}
+	return true
+}
+
+type corePrivatePrefix struct {
+	NodeID  string `json:"node_id"`
+	Network string `json:"network"`
+	Size    int    `json:"prefix_size_bytes"`
+	Prefix  string `json:"prefix"`
+}
+
+type corePublicPolicy struct {
+	prefixes []corePrivatePrefix
+	nodes    map[string]struct{}
+	paths    map[string]struct{}
+}
+
+func loadCorePublicPolicy(ctx context.Context, db *sql.DB) (*corePublicPolicy, error) {
+	var generation, materialized int64
+	var active bool
+	var raw []byte
+	err := db.QueryRowContext(ctx, `
+		SELECT visibility.generation, materialized.visibility_generation,
+		       EXISTS (SELECT 1 FROM privacy_rematerialization_queue
+		               WHERE status IN ('pending', 'processing', 'failed')),
+		       COALESCE(jsonb_agg(jsonb_build_object(
+		         'node_id', prefix.node_id, 'network', prefix.network,
+		         'prefix_size_bytes', prefix.prefix_size_bytes, 'prefix', prefix.prefix
+		       )) FILTER (WHERE prefix.node_id IS NOT NULL), '[]'::jsonb)
+		FROM public_visibility_state visibility
+		JOIN packet_visibility_materialization_state materialized
+		  ON materialized.singleton = visibility.singleton
+		LEFT JOIN private_node_prefixes prefix ON TRUE
+		WHERE visibility.singleton = TRUE
+		GROUP BY visibility.generation, materialized.visibility_generation`).Scan(
+		&generation, &materialized, &active, &raw)
+	if err != nil {
+		return nil, err
+	}
+	if generation < 1 || materialized != generation || active {
+		return nil, errors.New("UKMesh public privacy authority is stale or rematerializing")
+	}
+	var prefixes []corePrivatePrefix
+	if err := json.Unmarshal(raw, &prefixes); err != nil {
+		return nil, err
+	}
+	return &corePublicPolicy{prefixes: prefixes}, nil
+}
+
+func coreUKFamily(network string) bool {
+	return network == "ukmesh" || network == "northeast" || network == "teesside"
+}
+func coreNetworkKey(network string) string {
+	if coreUKFamily(network) {
+		return "ukmesh-family"
+	}
+	return network
+}
+
+func (p *corePublicPolicy) index() {
+	if p.nodes != nil {
+		return
+	}
+	p.nodes = make(map[string]struct{}, len(p.prefixes))
+	p.paths = make(map[string]struct{}, len(p.prefixes))
+	for _, prefix := range p.prefixes {
+		network := coreNetworkKey(prefix.Network)
+		p.nodes[network+":"+strings.ToUpper(prefix.NodeID)] = struct{}{}
+		p.paths[fmt.Sprintf("%s:%d:%s", network, prefix.Size, strings.ToUpper(prefix.Prefix))] = struct{}{}
+	}
+}
+
+func (p *corePublicPolicy) allows(e redisPendingEntry) bool {
+	if p == nil {
+		return false
+	}
+	p.index()
+	if len(e.pathHashes) > 0 {
+		if e.pathHashSizeBytes < 1 || e.pathHashSizeBytes > 3 {
+			return false
+		}
+		for _, path := range e.pathHashes {
+			if len(path) != e.pathHashSizeBytes*2 {
+				return false
+			}
+			for _, c := range path {
+				if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+					return false
+				}
+			}
+		}
+	}
+	network := coreNetworkKey(e.network)
+	if _, private := p.nodes[network+":"+strings.ToUpper(e.rxNodeID)]; private {
+		return false
+	}
+	if _, private := p.nodes[network+":"+strings.ToUpper(e.srcNodeID)]; private {
+		return false
+	}
+	for _, path := range e.pathHashes {
+		if _, private := p.paths[fmt.Sprintf("%s:%d:%s", network, e.pathHashSizeBytes, strings.ToUpper(path))]; private {
+			return false
+		}
 	}
 	return true
 }
@@ -196,6 +311,10 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 		log.Printf("[redis:%s] ERROR: no url configured — source disabled", tag)
 		return
 	}
+	if err := waitForUpstreamIdentityReady(context.Background(), store); err != nil {
+		log.Printf("[redis:%s] ERROR: %v", tag, err)
+		return
+	}
 
 	opts, err := redis.ParseURL(src.URL)
 	if err != nil {
@@ -207,6 +326,34 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 	}
 	client := redis.NewClient(opts)
 	defer client.Close()
+	if len(cfg.PostgresSources) != 1 {
+		log.Printf("[redis:%s] ERROR: exactly one paired PostgreSQL completeness source is required", tag)
+		return
+	}
+	completenessDB, err := sql.Open("postgres", cfg.PostgresSources[0].DSN)
+	if err != nil {
+		log.Printf("[redis:%s] ERROR: completeness database: %v", tag, err)
+		return
+	}
+	defer completenessDB.Close()
+	var hasLedger bool
+	if err := completenessDB.QueryRow(`SELECT to_regclass('ingest_observation_ledger') IS NOT NULL`).Scan(&hasLedger); err != nil || !hasLedger {
+		log.Printf("[redis:%s] ERROR: committed-order ledger unavailable; source disabled: %v", tag, err)
+		return
+	}
+	var privacyDB *sql.DB
+	if src.PublicVisibilityRequired() {
+		privacyDSN := src.PrivacyDSN
+		if privacyDSN == "" {
+			privacyDSN = cfg.PostgresSources[0].DSN
+		}
+		privacyDB, err = sql.Open("postgres", privacyDSN)
+		if err != nil {
+			log.Printf("[redis:%s] ERROR: privacy database: %v", tag, err)
+			return
+		}
+		defer privacyDB.Close()
+	}
 	streamKey := src.StreamKeyOrDefault()
 
 	// Initial connectivity probe with a bounded retry loop — redis may still
@@ -307,11 +454,23 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 			time.Sleep(pollInterval)
 			continue
 		}
+		var policy *corePublicPolicy
+		if privacyDB != nil {
+			privacyCtx, cancelPrivacy := context.WithTimeout(context.Background(), 10*time.Second)
+			policy, err = loadCorePublicPolicy(privacyCtx, privacyDB)
+			cancelPrivacy()
+			if err != nil {
+				log.Printf("[redis:%s] public authority unavailable; cursor held: %v", tag, err)
+				time.Sleep(time.Second)
+				continue
+			}
+		}
 
 		type liveRow struct {
 			msg *pgMessage
 		}
 		rows := make([]liveRow, 0, len(entries))
+		decodeFailed := false
 		for _, x := range entries {
 			var raw string
 			switch v := x.Values["e"].(type) {
@@ -324,7 +483,7 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 			if !ok {
 				continue // commit marker or malformed: skip, cursor advances below
 			}
-			if !redisEntryAllowed(entry, src) {
+			if !redisEntryAllowed(entry, src) || (src.PublicVisibilityRequired() && !policy.allows(entry)) {
 				continue
 			}
 			env := pgEnvelope{
@@ -337,9 +496,11 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 			}
 			payload, merr := json.Marshal(env)
 			if merr != nil {
+				decodeFailed = true
+				log.Printf("[redis:%s] envelope encoding failed; cursor held: %v", tag, merr)
 				continue
 			}
-			rows = append(rows, liveRow{msg: &pgMessage{topic: entry.topic, payload: payload}})
+			rows = append(rows, liveRow{msg: &pgMessage{topic: entry.topic, payload: payload, obsID: entry.observationID}})
 		}
 
 		for ingestBuffer.Pending() > bufferHighWater {
@@ -348,28 +509,34 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 
 		droppedBefore := ingestBuffer.Dropped()
 		batchStart := time.Now()
+		completed := make([]<-chan error, 0, len(rows))
+		admissionFailed := false
 		for i := range rows {
 			r := rows[i]
-			ingestBuffer.Submit(func() {
-				handleMessage(store, tag, srcForHandler, r.msg, keySet.Snapshot(), regionSet, cfg)
+			result, accepted := ingestBuffer.SubmitTracked(func() error {
+				return handleMessage(store, tag, srcForHandler, r.msg, keySet.Snapshot(), regionSet, cfg)
 			})
+			if !accepted {
+				admissionFailed = true
+				continue
+			}
+			completed = append(completed, result)
 		}
 
-		// Wait for the batch to fully drain before advancing the cursor: it
-		// must never point past entries that have not reached the database.
-		for ingestBuffer.Pending() > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if d := ingestBuffer.Dropped() - droppedBefore; d > 0 {
-			log.Printf("[redis:%s] WARNING: ingest buffer dropped %d entr(y/ies) — not advancing cursor, retrying batch", tag, d)
+		writeErr := waitTrackedIngestJobs(completed)
+		if d := ingestBuffer.Dropped() - droppedBefore; admissionFailed || decodeFailed || d > 0 || writeErr != nil {
+			log.Printf("[redis:%s] WARNING: batch incomplete (dropped=%d, writeError=%v) — cursor held for retry", tag, d, writeErr)
 			time.Sleep(time.Second)
 			continue
 		}
 
-		state.LastID = entries[len(entries)-1].ID
-		if err := saveRedisSourceState(statePath, state); err != nil {
-			log.Printf("[redis:%s] cursor save error (non-fatal; cursor held in memory): %v", tag, err)
+		nextState := redisSourceState{LastID: entries[len(entries)-1].ID}
+		if err := saveRedisSourceState(statePath, nextState); err != nil {
+			log.Printf("[redis:%s] cursor save error (cursor held for retry): %v", tag, err)
+			time.Sleep(time.Second)
+			continue
 		}
+		state = nextState
 		status.MarkPacket(time.Now())
 
 		elapsed := time.Since(batchStart)

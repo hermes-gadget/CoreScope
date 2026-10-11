@@ -48,8 +48,9 @@ const pgZeroObsID = "00000000-0000-0000-0000-000000000000"
 // the last row whose batch fully drained into the database. Resuming from
 // this pair re-reads nothing and skips nothing.
 type pgSourceState struct {
-	LastTime  string `json:"lastTime"`  // RFC3339Nano, UTC
-	LastObsID string `json:"lastObsId"` // UUID as text
+	LastTime  string `json:"lastTime"`          // RFC3339Nano, UTC
+	LastObsID string `json:"lastObsId"`         // UUID as text
+	LastSeq   int64  `json:"lastSeq,omitempty"` // committed-order UKMesh ledger cursor
 }
 
 // loadPgSourceState reads the cursor file. A missing or corrupt file reads
@@ -60,7 +61,7 @@ func loadPgSourceState(path string) (pgSourceState, bool) {
 		return pgSourceState{}, false
 	}
 	var st pgSourceState
-	if err := json.Unmarshal(raw, &st); err != nil || st.LastTime == "" {
+	if err := json.Unmarshal(raw, &st); err != nil || (st.LastTime == "" && st.LastSeq == 0) {
 		return pgSourceState{}, false
 	}
 	return st, true
@@ -85,15 +86,17 @@ func savePgSourceState(path string, st pgSourceState) error {
 type pgMessage struct {
 	topic   string
 	payload []byte
+	obsID   string
 }
 
-func (m *pgMessage) Topic() string     { return m.topic }
-func (m *pgMessage) Payload() []byte   { return m.payload }
-func (m *pgMessage) Qos() byte         { return 0 }
-func (m *pgMessage) Retained() bool    { return false }
-func (m *pgMessage) Duplicate() bool   { return false }
-func (m *pgMessage) MessageID() uint16 { return 0 }
-func (m *pgMessage) Ack()              {}
+func (m *pgMessage) Topic() string         { return m.topic }
+func (m *pgMessage) Payload() []byte       { return m.payload }
+func (m *pgMessage) Qos() byte             { return 0 }
+func (m *pgMessage) Retained() bool        { return false }
+func (m *pgMessage) Duplicate() bool       { return false }
+func (m *pgMessage) MessageID() uint16     { return 0 }
+func (m *pgMessage) Ack()                  {}
+func (m *pgMessage) ObservationID() string { return m.obsID }
 
 // pgEnvelope is the JSON payload the handler parses; it mirrors what
 // observers publish to MQTT.
@@ -116,7 +119,54 @@ type pgRow struct {
 	Direction  string
 	OriginName string
 	ObsID      string
+	Seq        int64
 }
+
+// The UKMesh packet writer acquires one transaction advisory lock before it
+// allocates ledger sequences. A later writer cannot allocate/commit its seq
+// until the earlier writer commits or aborts. Thus a visible seq > cursor
+// cannot hide an in-flight smaller seq; gaps from aborted writes are safe.
+func buildPgLedgerBatchQuery(src PostgresSource, cursor pgSourceState, batchSize int) (string, []interface{}) {
+	var b strings.Builder
+	args := []interface{}{cursor.LastSeq}
+	b.WriteString(`SELECT p.time, p.topic, p.raw_hex, p.snr, p.rssi,
+       COALESCE(p.payload->>'direction', '') AS direction,
+       COALESCE(n.name, '') AS origin_name,
+       l.observation_id::text AS obs_id, l.seq
+FROM ingest_observation_ledger l
+JOIN packets p ON p.observation_id = l.observation_id
+LEFT JOIN nodes n ON n.public_key = p.rx_node_id
+WHERE l.seq > $1 AND p.raw_hex IS NOT NULL AND p.raw_hex <> ''`)
+	if len(src.Networks) > 0 {
+		args = append(args, pq.Array(src.Networks))
+		b.WriteString(fmt.Sprintf("\n  AND p.network = ANY($%d)", len(args)))
+	}
+	if src.PublicVisibilityRequired() {
+		b.WriteString(currentPublicPacketSQL)
+	}
+	b.WriteString(fmt.Sprintf("\nORDER BY l.seq\nLIMIT $%d", len(args)+1))
+	args = append(args, batchSize)
+	return b.String(), args
+}
+
+// The same current-state predicate applies to legacy and ledger reads. A
+// rematerialization or mismatched generation fails the whole public batch
+// closed, while current node/path privacy overrides frozen packet flags.
+const currentPublicPacketSQL = `
+  AND meshcore_path_is_valid(p.path_hashes, p.path_hash_size_bytes)
+  AND NOT meshcore_path_matches_private(p.network, p.rx_node_id, p.src_node_id,
+                                        p.path_hashes, p.path_hash_size_bytes)
+  AND EXISTS (
+    SELECT 1 FROM public_visibility_state current_visibility
+    JOIN packet_visibility_materialization_state materialized
+      ON materialized.singleton = current_visibility.singleton
+    WHERE current_visibility.singleton = TRUE
+      AND materialized.visibility_generation = current_visibility.generation
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM privacy_rematerialization_queue
+    WHERE status IN ('pending', 'processing', 'failed')
+  )`
 
 // buildPgBatchQuery returns the keyset-paginated SELECT and its args.
 // $1/$2 are the cursor (time, observation_id). Optional filters: a network
@@ -138,7 +188,7 @@ WHERE (p.time, COALESCE(p.observation_id, '` + pgZeroObsID + `'::uuid)) > ($1::t
 		b.WriteString(fmt.Sprintf("\n  AND p.network = ANY($%d)", len(args)))
 	}
 	if src.PublicVisibilityRequired() {
-		b.WriteString("\n  AND p.visibility_ok IS TRUE AND p.is_private IS NOT TRUE")
+		b.WriteString(currentPublicPacketSQL)
 	}
 	b.WriteString(fmt.Sprintf("\nORDER BY p.time, COALESCE(p.observation_id, '%s'::uuid)\nLIMIT $%d", pgZeroObsID, len(args)+1))
 	args = append(args, batchSize)
@@ -178,14 +228,20 @@ func redactPgDSN(dsn string) string {
 }
 
 // scanPgRows drains a result set into pgRows.
-func scanPgRows(rows *sql.Rows) ([]pgRow, error) {
+func scanPgRows(rows *sql.Rows, ledger bool) ([]pgRow, error) {
 	out := make([]pgRow, 0, 64)
 	for rows.Next() {
 		var (
 			r         pgRow
 			snr, rssi sql.NullFloat64
 		)
-		if err := rows.Scan(&r.Time, &r.Topic, &r.RawHex, &snr, &rssi, &r.Direction, &r.OriginName, &r.ObsID); err != nil {
+		var err error
+		if ledger {
+			err = rows.Scan(&r.Time, &r.Topic, &r.RawHex, &snr, &rssi, &r.Direction, &r.OriginName, &r.ObsID, &r.Seq)
+		} else {
+			err = rows.Scan(&r.Time, &r.Topic, &r.RawHex, &snr, &rssi, &r.Direction, &r.OriginName, &r.ObsID)
+		}
+		if err != nil {
 			return nil, err
 		}
 		if snr.Valid {
@@ -211,6 +267,10 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 	}
 	if src.DSN == "" {
 		log.Printf("[pg:%s] ERROR: no dsn configured — source disabled", tag)
+		return
+	}
+	if err := waitForUpstreamIdentityReady(context.Background(), store); err != nil {
+		log.Printf("[pg:%s] ERROR: %v", tag, err)
 		return
 	}
 
@@ -241,6 +301,15 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 		time.Sleep(5 * time.Second)
 	}
 	log.Printf("[pg:%s] connected to %s", tag, redactPgDSN(src.DSN))
+	var ledgerAvailable bool
+	if err := db.QueryRow(`SELECT to_regclass('ingest_observation_ledger') IS NOT NULL`).Scan(&ledgerAvailable); err != nil {
+		log.Printf("[pg:%s] ERROR: ledger capability check: %v", tag, err)
+		return
+	}
+	if len(cfg.RedisSources) > 0 && !ledgerAvailable {
+		log.Printf("[pg:%s] ERROR: paired Redis source requires UKMesh committed-order ledger; source disabled", tag)
+		return
+	}
 
 	statePath := src.StatePath
 	if statePath == "" {
@@ -300,7 +369,13 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 	backoff := time.Second
 
 	for {
-		query, args := buildPgBatchQuery(src, state, batchSize)
+		var query string
+		var args []interface{}
+		if ledgerAvailable {
+			query, args = buildPgLedgerBatchQuery(src, state, batchSize)
+		} else {
+			query, args = buildPgBatchQuery(src, state, batchSize)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		rows, qerr := db.QueryContext(ctx, query, args...)
 		if qerr != nil {
@@ -313,7 +388,7 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 			}
 			continue
 		}
-		batch, serr := scanPgRows(rows)
+		batch, serr := scanPgRows(rows, ledgerAvailable)
 		rows.Close()
 		cancel()
 		if serr != nil {
@@ -344,11 +419,13 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 
 		droppedBefore := ingestBuffer.Dropped()
 		batchStart := time.Now()
+		completed := make([]<-chan error, 0, len(batch))
+		admissionFailed := false
 		for i := range batch {
 			r := batch[i]
 			env := pgEnvelope{
 				Raw:       r.RawHex,
-				Timestamp: r.Time.UTC().Format(time.RFC3339),
+				Timestamp: r.Time.UTC().Format(time.RFC3339Nano),
 				SNR:       r.SNR,
 				RSSI:      r.RSSI,
 				Direction: r.Direction,
@@ -356,34 +433,40 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 			}
 			payload, merr := json.Marshal(env)
 			if merr != nil {
+				admissionFailed = true
+				log.Printf("[pg:%s] envelope encoding failed; cursor held: %v", tag, merr)
 				continue
 			}
-			m := &pgMessage{topic: r.Topic, payload: payload}
-			ingestBuffer.Submit(func() {
-				handleMessage(store, tag, srcForHandler, m, keySet.Snapshot(), regionSet, cfg)
+			m := &pgMessage{topic: r.Topic, payload: payload, obsID: r.ObsID}
+			result, accepted := ingestBuffer.SubmitTracked(func() error {
+				return handleMessage(store, tag, srcForHandler, m, keySet.Snapshot(), regionSet, cfg)
 			})
+			if !accepted {
+				admissionFailed = true
+				continue
+			}
+			completed = append(completed, result)
 		}
 
-		// Wait for the batch to fully drain before advancing the cursor:
-		// the cursor must never point past rows that have not reached the
-		// database, or a crash would skip them on resume.
-		for ingestBuffer.Pending() > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if d := ingestBuffer.Dropped() - droppedBefore; d > 0 {
-			log.Printf("[pg:%s] WARNING: ingest buffer dropped %d row(s) — not advancing cursor, retrying batch", tag, d)
+		writeErr := waitTrackedIngestJobs(completed)
+		if d := ingestBuffer.Dropped() - droppedBefore; admissionFailed || d > 0 || writeErr != nil {
+			log.Printf("[pg:%s] WARNING: batch incomplete (dropped=%d, writeError=%v) — cursor held for retry", tag, d, writeErr)
 			time.Sleep(time.Second)
 			continue
 		}
 
 		last := batch[len(batch)-1]
-		state = pgSourceState{
+		nextState := pgSourceState{
 			LastTime:  last.Time.UTC().Format(time.RFC3339Nano),
 			LastObsID: last.ObsID,
+			LastSeq:   last.Seq,
 		}
-		if err := savePgSourceState(statePath, state); err != nil {
-			log.Printf("[pg:%s] cursor save error (non-fatal; cursor held in memory): %v", tag, err)
+		if err := savePgSourceState(statePath, nextState); err != nil {
+			log.Printf("[pg:%s] cursor save error (cursor held for retry): %v", tag, err)
+			time.Sleep(time.Second)
+			continue
 		}
+		state = nextState
 		status.MarkPacket(time.Now())
 
 		elapsed := time.Since(batchStart)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -9,6 +10,61 @@ import (
 	"testing"
 	"time"
 )
+
+func TestF08TrackedJobReportsActiveCompletionAndWriteFailure(t *testing.T) {
+	b := NewIngestBuffer(2)
+	b.Start()
+	b.Ready()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		b.Stop()
+	})
+	want := errors.New("sqlite write failed")
+	completed, accepted := b.SubmitTracked(func() error {
+		close(started)
+		<-release
+		return want
+	})
+	if !accepted {
+		t.Fatal("tracked job rejected unexpectedly")
+	}
+	<-started
+	if b.Pending() != 0 {
+		t.Fatalf("expected the active job to have left the queue, got %d", b.Pending())
+	}
+	select {
+	case <-completed:
+		t.Fatal("completion reported while last job remains active")
+	default:
+	}
+	close(release)
+	select {
+	case err := <-completed:
+		if !errors.Is(err, want) {
+			t.Fatalf("expected write failure, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tracked job did not report completion")
+	}
+}
+
+func TestF08TrackedJobReportsAdmissionFailure(t *testing.T) {
+	b := NewIngestBuffer(1)
+	b.Submit(func() {})
+	completed, accepted := b.SubmitTracked(func() error { return nil })
+	if accepted || completed != nil {
+		t.Fatal("full buffer accepted a tracked job")
+	}
+	if b.Dropped() != 1 {
+		t.Fatalf("expected one drop, got %d", b.Dropped())
+	}
+}
 
 func TestIngestBuffer_BuffersUntilReady(t *testing.T) {
 	b := NewIngestBuffer(10)

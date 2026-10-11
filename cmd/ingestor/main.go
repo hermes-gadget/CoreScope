@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -50,6 +51,9 @@ func main() {
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if err := cfg.ValidateCompanionSources(); err != nil {
 		log.Fatalf("config: %v", err)
 	}
 
@@ -846,13 +850,14 @@ func buildForceReconnectFn(client mqtt.Client, tag string) func() {
 	}
 }
 
-func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) {
+func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) (writeErr error) {
 	// Liveness watchdog (#1212): record receipt before any processing so a
 	// slow handler still counts as "source is alive". Cheap atomic store.
 	markLivenessForTag(tag, time.Now())
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("MQTT [%s] panic in handler: %v", tag, r)
+			writeErr = errors.Join(writeErr, fmt.Errorf("ingest handler panic: %v", r))
 		}
 	}()
 
@@ -1056,6 +1061,13 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		if len(parts) > 1 {
 			region = clampObserverField(parts[1], maxObserverIATALen)
 		}
+		upstreamObservationID := ""
+		if sourceMessage, ok := m.(interface{ ObservationID() string }); ok {
+			upstreamObservationID = sourceMessage.ObservationID()
+			if upstreamObservationID == pgZeroObsID {
+				upstreamObservationID = ""
+			}
+		}
 		// Fallback to source-level region config when topic has no region (#788)
 		if region == "" && source.Region != "" {
 			region = source.Region
@@ -1068,6 +1080,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			// Issue #1478: record so /api/observers can surface ⚠️ chip.
 			if err := store.RecordNaiveSkew(observerID, naiveSkewSec, time.Now()); err != nil {
 				log.Printf("MQTT [%s] RecordNaiveSkew(%s): %v", tag, observerID, err)
+				writeErr = errors.Join(writeErr, err)
 			}
 		}
 		// Parse optional region from JSON payload (#788)
@@ -1109,6 +1122,19 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		if v, ok := msg["origin"].(string); ok {
 			mqttMsg.Origin = v
 		}
+		acceptedObservation := false
+		prepareSourceObserver := func() error {
+			if !source.PreserveEnvelopeTime || observerID == "" {
+				return nil
+			}
+			effectiveRegion := region
+			if mqttMsg.Region != "" {
+				effectiveRegion = mqttMsg.Region
+			}
+			return store.upsertObserverAtCount(observerID,
+				clampObserverField(mqttMsg.Origin, maxObserverTextLen), effectiveRegion,
+				nil, mqttMsg.Timestamp, 0)
+		}
 
 		// For ADVERT packets with known coordinates, enforce geo_filter before
 		// storing anything — drop the entire message if outside the area.
@@ -1127,7 +1153,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 				}
 				log.Printf("MQTT [%s] DROPPED invalid signature: hash=%s name=%s observer=%s pubkey=%s",
 					tag, hash, sanitizeLogString(decoded.Payload.Name), sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)), truncPK)
-				store.InsertDroppedPacket(&DroppedPacket{
+				if err := store.InsertDroppedPacket(&DroppedPacket{
 					Hash:         hash,
 					RawHex:       rawHex,
 					Reason:       "invalid signature",
@@ -1135,7 +1161,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					ObserverName: mqttMsg.Origin,
 					NodePubKey:   decoded.Payload.PubKey,
 					NodeName:     decoded.Payload.Name,
-				})
+				}); err != nil {
+					writeErr = errors.Join(writeErr, err)
+				}
 				return
 			}
 			foreign := false
@@ -1160,47 +1188,74 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			}
 			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
 			pktData.Foreign = foreign
+			pktData.UpstreamObservationID = upstreamObservationID
+			if err := prepareSourceObserver(); err != nil {
+				return err
+			}
 			isNew, err := store.InsertTransmission(pktData)
 			if err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
+			} else {
+				acceptedObservation = pktData.ObservationInserted
 			}
 			role := advertRole(decoded.Payload.Flags)
 			if err := store.UpsertNode(decoded.Payload.PubKey, decoded.Payload.Name, role, decoded.Payload.Lat, decoded.Payload.Lon, pktData.Timestamp); err != nil {
 				log.Printf("MQTT [%s] node upsert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
 			}
 			if foreign {
 				if err := store.MarkNodeForeign(decoded.Payload.PubKey); err != nil {
 					log.Printf("MQTT [%s] mark foreign error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 			if isNew {
 				if err := store.IncrementAdvertCount(decoded.Payload.PubKey); err != nil {
 					log.Printf("MQTT [%s] advert count error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 			// Update telemetry if present in advert
 			if decoded.Payload.BatteryMv != nil || decoded.Payload.TemperatureC != nil {
 				if err := store.UpdateNodeTelemetry(decoded.Payload.PubKey, decoded.Payload.BatteryMv, decoded.Payload.TemperatureC); err != nil {
 					log.Printf("MQTT [%s] node telemetry update error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 			// Update default_scope when advert carries a matched transport scope (#899, #1534)
 			if shouldUpdateDefaultScope(pktData) {
 				if err := store.UpdateNodeDefaultScope(decoded.Payload.PubKey, pktData.ScopeName); err != nil {
 					log.Printf("MQTT [%s] node default_scope update error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 		} else {
 			// Non-ADVERT packets: store normally (routing/channel messages from
 			// in-area observers are relevant regardless of relay hop origin).
 			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
+			pktData.UpstreamObservationID = upstreamObservationID
+			if err := prepareSourceObserver(); err != nil {
+				return err
+			}
 			if _, err := store.InsertTransmission(pktData); err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
+			} else {
+				acceptedObservation = pktData.ObservationInserted
 			}
 		}
 
 		// Upsert observer
 		if observerID != "" {
+			if source.PreserveEnvelopeTime {
+				if acceptedObservation {
+					if err := store.IncrementObserverPacketCount(observerID); err != nil {
+						writeErr = errors.Join(writeErr, err)
+					}
+				}
+				return
+			}
 			origin, _ := msg["origin"].(string)
 			origin = clampObserverField(origin, maxObserverTextLen)
 			// Use effective region: payload > topic > source config (#788)
@@ -1221,6 +1276,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			}
 			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, lastSeenArg); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
 			}
 		}
 
@@ -1418,6 +1474,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		log.Print(formatDirectMessageLog(tag, firstNonEmpty(sender, "unknown")))
 		return
 	}
+	return
 }
 
 func toFloat64(v interface{}) (float64, bool) {

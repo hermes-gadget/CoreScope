@@ -109,6 +109,9 @@ type RedisSource struct {
 	URL string `json:"url"`
 	// Password overrides the password embedded in URL when set.
 	Password string `json:"password,omitempty"`
+	// Required for public reads when no paired postgres source is configured.
+	// The reader checks current UKMesh visibility state once per batch.
+	PrivacyDSN string `json:"privacyDsn,omitempty"`
 	// StreamKey is the stream name (default meshcore:ingest:pending).
 	StreamKey string `json:"streamKey,omitempty"`
 	// PollIntervalMs is the delay between polls for new entries (default 500).
@@ -185,7 +188,7 @@ type Config struct {
 	MQTTSources []MQTTSource `json:"mqttSources,omitempty"`
 	// PostgresSources read packets from an existing meshcore PostgreSQL /
 	// TimescaleDB deployment (backfill + follow) — see postgres_source.go.
-	PostgresSources      []PostgresSource            `json:"postgresSources,omitempty"`
+	PostgresSources []PostgresSource `json:"postgresSources,omitempty"`
 	// RedisSources read pending observations from a ukmesh RAM-first ingest
 	// stream (live fast-path ahead of the postgres follow) — see redis_source.go.
 	RedisSources         []RedisSource               `json:"redisSources,omitempty"`
@@ -254,6 +257,17 @@ type Config struct {
 	// ingestor reads: where users.db is and whether approved hashtag channels
 	// are decrypted. Everything else in the block belongs to the server.
 	UserManagement *UserManagementConfig `json:"userManagement,omitempty"`
+}
+
+// A Redis stream is a bounded live tail, never a completeness source.
+func (c *Config) ValidateCompanionSources() error {
+	if len(c.RedisSources) == 0 {
+		return nil
+	}
+	if len(c.PostgresSources) != 1 {
+		return fmt.Errorf("redisSources requires exactly one paired postgresSources completeness follower")
+	}
+	return nil
 }
 
 // NeighborEdgesDaysOrDefault returns the configured pruning window or 5.

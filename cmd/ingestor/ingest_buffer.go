@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -81,12 +82,37 @@ func NewIngestBuffer(capacity int) *IngestBuffer {
 //
 // All log lines include the buffer capacity for operator triage.
 func (b *IngestBuffer) Submit(job func()) {
+	b.enqueue(job)
+}
+
+// SubmitTracked returns a completion channel that includes execution of the
+// active job. Historical source cursors must wait on it, not on Pending(),
+// which counts only jobs still in the queue. A full buffer returns false.
+func (b *IngestBuffer) SubmitTracked(job func() error) (<-chan error, bool) {
+	completed := make(chan error, 1)
+	if !b.enqueue(func() {
+		defer close(completed)
+		defer func() {
+			if value := recover(); value != nil {
+				completed <- fmt.Errorf("ingest job panic: %v", value)
+			}
+		}()
+		completed <- job()
+	}) {
+		return nil, false
+	}
+	return completed, true
+}
+
+func (b *IngestBuffer) enqueue(job func()) bool {
 	select {
 	case b.jobs <- job:
 		b.maybeLogRecovery()
+		return true
 	default:
 		n := b.dropped.Add(1)
 		b.logDrop(n)
+		return false
 	}
 }
 
