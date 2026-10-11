@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,7 +87,9 @@ func main() {
 	log.Printf("SQLite opened: %s", cfg.DBPath)
 
 	// Async backfill: path_json from raw_hex (#888) — must not block MQTT startup
-	store.BackfillPathJSONAsync()
+	if !cfg.PublicProjection {
+		store.BackfillPathJSONAsync()
+	}
 
 	// Soft-delete blacklisted observers (#1287 — moved from cmd/server).
 	if len(cfg.ObserverBlacklist) > 0 {
@@ -95,7 +98,9 @@ func main() {
 
 	// Async backfill: from_pubkey for legacy ADVERT rows (#1143).
 	// Moved from cmd/server in #1287. Best-effort; must not block MQTT.
-	go store.BackfillFromPubkey(5000, 100*time.Millisecond, nil)
+	if !cfg.PublicProjection {
+		go store.BackfillFromPubkey(5000, 100*time.Millisecond, nil)
+	}
 
 	// Check auto_vacuum mode and optionally migrate (#919)
 	store.CheckAutoVacuum(cfg)
@@ -135,8 +140,36 @@ func main() {
 	} else {
 		log.Printf("[regions] autoRegionKeys disabled — only the %d configured hashRegions key(s) are in force", len(regionSet.snapshot().all))
 	}
-	store.BackfillDefaultScopeAsync(regionSet)
-	store.BackfillTransportCodesAsync()
+	if !cfg.PublicProjection {
+		store.BackfillDefaultScopeAsync(regionSet)
+		store.BackfillTransportCodesAsync()
+	}
+	if cfg.PublicProjection {
+		authority, err := sql.Open("postgres", cfg.PostgresSources[0].DSN)
+		if err != nil {
+			log.Fatalf("public projection authority: %v", err)
+		}
+		defer authority.Close()
+		authority.SetMaxOpenConns(2)
+		store.publicProjection, err = newCorePublicProjection(store,
+			func(ctx context.Context) (*corePublicPolicy, error) {
+				var covered bool
+				if err := authority.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM ingest_observation_ledger_coverage WHERE singleton=TRUE AND version=1)`).Scan(&covered); err != nil {
+					return nil, err
+				}
+				if !covered {
+					return nil, errors.New("committed historical coverage is required")
+				}
+				return loadCorePublicPolicy(ctx, authority)
+			},
+			func(record publicProjectionRecord) error {
+				return handleMessage(store, record.Tag, record.Source,
+					&pgMessage{topic: record.Topic, payload: record.Payload, obsID: record.ObservationID}, keySet.Snapshot(), regionSet, cfg)
+			}, cfg.Retention.PacketDays)
+		if err != nil {
+			log.Fatalf("public projection: %v", err)
+		}
+	}
 
 	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
 	// before startup maintenance so no packets are missed while the single
@@ -144,6 +177,34 @@ func main() {
 	// messages are buffered here and drained once Ready() is called below.
 	ingestBuffer := NewIngestBuffer(cfg.IngestBufferSizeOrDefault())
 	ingestBuffer.Start()
+	if store.publicProjection != nil {
+		projectionCtx, cancelProjection := context.WithCancel(context.Background())
+		defer cancelProjection()
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-projectionCtx.Done():
+					return
+				case <-ticker.C:
+				}
+				result, accepted := ingestBuffer.SubmitTracked(func() error {
+					ctx, cancel := context.WithTimeout(projectionCtx, 10*time.Second)
+					defer cancel()
+					_, err := store.publicProjection.Refresh(ctx)
+					return err
+				})
+				if accepted {
+					select {
+					case <-projectionCtx.Done():
+						return
+					case <-result:
+					}
+				}
+			}
+		}()
+	}
 
 	// Connect to each MQTT source
 	var clients []mqtt.Client
@@ -396,8 +457,10 @@ func main() {
 	// Its known evidence is a lower bound: old UPSERTs erased some frames.
 	evidenceCtx, stopEvidenceBackfill := context.WithCancel(context.Background())
 	defer stopEvidenceBackfill()
-	if err := store.RunAsyncMigration(evidenceCtx, "advert_route_evidence_v1", store.backfillAdvertEvidence); err != nil {
-		log.Printf("[migration] scheduling advert evidence backfill: %v", err)
+	if !cfg.PublicProjection {
+		if err := store.RunAsyncMigration(evidenceCtx, "advert_route_evidence_v1", store.backfillAdvertEvidence); err != nil {
+			log.Printf("[migration] scheduling advert evidence backfill: %v", err)
+		}
 	}
 	if d := ingestBuffer.Dropped(); d > 0 {
 		log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
@@ -665,9 +728,11 @@ func main() {
 	// path-trust threshold. Resolved once here so every tick shares the
 	// same operator-configured value.
 	neighborTrust := cfg.GetPathTrust()
-	stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval, &neighborTrust)
-	defer stopNeighborBuilder()
-	log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
+	if !cfg.PublicProjection {
+		stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval, &neighborTrust)
+		defer stopNeighborBuilder()
+		log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
+	}
 
 	// #1212: per-source stall watchdog. Detects "silently dead" sources
 	// where the client reports connected but no messages have flowed. Logs

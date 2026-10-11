@@ -126,8 +126,29 @@ func TestF07RedisTailRequiresPairedCompletenessSource(t *testing.T) {
 		t.Fatal("tail-only Redis source must be rejected")
 	}
 	cfg.PostgresSources = []PostgresSource{{Name: "complete", DSN: "postgres://fixture"}}
+	cfg.PublicProjection = true
+	cfg.Retention = &RetentionConfig{PacketDays: 30}
+	cfg.RedisSources[0].PublicURL = "http://localhost/entries"
+	cfg.RedisSources[0].PublicToken = "fixture"
 	if err := cfg.ValidateCompanionSources(); err != nil {
 		t.Fatalf("paired source rejected: %v", err)
+	}
+}
+
+func TestF16PublicSourceCannotReceiveRawRedisCredentials(t *testing.T) {
+	cfg := &Config{PublicProjection: true, Retention: &RetentionConfig{PacketDays: 30},
+		PostgresSources: []PostgresSource{{DSN: "postgres://fixture"}},
+		RedisSources:    []RedisSource{{URL: "redis://:secret@localhost", PublicURL: "http://localhost/entries", PublicToken: "fixture"}}}
+	if cfg.ValidateCompanionSources() == nil {
+		t.Fatal("public consumer received a raw Redis principal")
+	}
+	cfg.RedisSources[0].URL = ""
+	if err := cfg.ValidateCompanionSources(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.MQTTSources = []MQTTSource{{Broker: "mqtt://localhost"}}
+	if cfg.ValidateCompanionSources() == nil {
+		t.Fatal("revocable projection accepted untracked mixed traffic")
 	}
 }
 

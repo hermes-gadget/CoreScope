@@ -48,9 +48,10 @@ const pgZeroObsID = "00000000-0000-0000-0000-000000000000"
 // the last row whose batch fully drained into the database. Resuming from
 // this pair re-reads nothing and skips nothing.
 type pgSourceState struct {
-	LastTime  string `json:"lastTime"`          // RFC3339Nano, UTC
-	LastObsID string `json:"lastObsId"`         // UUID as text
-	LastSeq   int64  `json:"lastSeq,omitempty"` // committed-order UKMesh ledger cursor
+	PolicyGeneration int64  `json:"policyGeneration,omitempty"`
+	LastTime         string `json:"lastTime"`          // RFC3339Nano, UTC
+	LastObsID        string `json:"lastObsId"`         // UUID as text
+	LastSeq          int64  `json:"lastSeq,omitempty"` // committed-order UKMesh ledger cursor
 }
 
 // loadPgSourceState reads the cursor file. A missing or corrupt file reads
@@ -111,15 +112,20 @@ type pgEnvelope struct {
 
 // pgRow is one scanned packets row.
 type pgRow struct {
-	Time       time.Time
-	Topic      string
-	RawHex     string
-	SNR        *float64
-	RSSI       *float64
-	Direction  string
-	OriginName string
-	ObsID      string
-	Seq        int64
+	Network           string
+	RXNodeID          string
+	SrcNodeID         string
+	PathHashes        []string
+	PathHashSizeBytes int
+	Time              time.Time
+	Topic             string
+	RawHex            string
+	SNR               *float64
+	RSSI              *float64
+	Direction         string
+	OriginName        string
+	ObsID             string
+	Seq               int64
 }
 
 // The UKMesh packet writer acquires one transaction advisory lock before it
@@ -132,7 +138,9 @@ func buildPgLedgerBatchQuery(src PostgresSource, cursor pgSourceState, batchSize
 	b.WriteString(`SELECT p.time, p.topic, p.raw_hex, p.snr, p.rssi,
        COALESCE(p.payload->>'direction', '') AS direction,
        COALESCE(n.name, '') AS origin_name,
-       l.observation_id::text AS obs_id, l.seq
+       l.observation_id::text AS obs_id, l.seq,
+       COALESCE(p.network,''), COALESCE(p.rx_node_id,''), COALESCE(p.src_node_id,''),
+       COALESCE(p.path_hashes,ARRAY[]::text[]), COALESCE(p.path_hash_size_bytes,0)
 FROM ingest_observation_ledger l
 JOIN packets p ON p.observation_id = l.observation_id AND p.time = l.observed_at
 LEFT JOIN nodes n ON n.public_key = p.rx_node_id
@@ -239,7 +247,8 @@ func scanPgRows(rows *sql.Rows, ledger bool) ([]pgRow, error) {
 		)
 		var err error
 		if ledger {
-			err = rows.Scan(&r.Time, &r.Topic, &r.RawHex, &snr, &rssi, &r.Direction, &r.OriginName, &r.ObsID, &r.Seq)
+			err = rows.Scan(&r.Time, &r.Topic, &r.RawHex, &snr, &rssi, &r.Direction, &r.OriginName, &r.ObsID, &r.Seq,
+				&r.Network, &r.RXNodeID, &r.SrcNodeID, pq.Array(&r.PathHashes), &r.PathHashSizeBytes)
 		} else {
 			err = rows.Scan(&r.Time, &r.Topic, &r.RawHex, &snr, &rssi, &r.Direction, &r.OriginName, &r.ObsID)
 		}
@@ -313,7 +322,7 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 		log.Printf("[pg:%s] ERROR: ledger historical coverage migration 059 is required; source disabled", tag)
 		return
 	}
-	if len(cfg.RedisSources) > 0 && !ledgerAvailable {
+	if (len(cfg.RedisSources) > 0 || cfg.PublicProjection) && !ledgerAvailable {
 		log.Printf("[pg:%s] ERROR: paired Redis source requires UKMesh committed-order ledger; source disabled", tag)
 		return
 	}
@@ -376,6 +385,24 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 	backoff := time.Second
 
 	for {
+		if src.PublicVisibilityRequired() {
+			if store.publicProjection == nil {
+				log.Printf("[pg:%s] ERROR: public projection is required", tag)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			generation, err := store.publicProjection.Refresh(ctx)
+			cancel()
+			if err != nil {
+				status.MarkDisconnect(time.Now(), err)
+				time.Sleep(time.Second)
+				continue
+			}
+			if state.PolicyGeneration != generation {
+				state.LastSeq = 0
+				state.PolicyGeneration = generation
+			}
+		}
 		var query string
 		var args []interface{}
 		if ledgerAvailable {
@@ -428,6 +455,7 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 		batchStart := time.Now()
 		completed := make([]<-chan error, 0, len(batch))
 		admissionFailed := false
+		projectionRecords := make([]publicProjectionRecord, 0, len(batch))
 		for i := range batch {
 			r := batch[i]
 			env := pgEnvelope{
@@ -445,6 +473,12 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 				continue
 			}
 			m := &pgMessage{topic: r.Topic, payload: payload, obsID: r.ObsID}
+			if src.PublicVisibilityRequired() {
+				projectionRecords = append(projectionRecords, publicProjectionRecord{ObservationID: r.ObsID, Topic: r.Topic, Payload: payload,
+					Network: r.Network, RXNodeID: r.RXNodeID, SrcNodeID: r.SrcNodeID, PathHashes: r.PathHashes, PathHashSizeBytes: r.PathHashSizeBytes,
+					Tag: tag, Source: srcForHandler})
+				continue
+			}
 			result, accepted := ingestBuffer.SubmitTracked(func() error {
 				return handleMessage(store, tag, srcForHandler, m, keySet.Snapshot(), regionSet, cfg)
 			})
@@ -454,12 +488,25 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 			}
 			completed = append(completed, result)
 		}
+		if src.PublicVisibilityRequired() {
+			result, accepted := ingestBuffer.SubmitTracked(func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				return store.publicProjection.Batch(ctx, projectionRecords)
+			})
+			if accepted {
+				completed = append(completed, result)
+			} else {
+				admissionFailed = true
+			}
+		}
 
 		last := batch[len(batch)-1]
 		nextState := pgSourceState{
-			LastTime:  last.Time.UTC().Format(time.RFC3339Nano),
-			LastObsID: last.ObsID,
-			LastSeq:   last.Seq,
+			PolicyGeneration: state.PolicyGeneration,
+			LastTime:         last.Time.UTC().Format(time.RFC3339Nano),
+			LastObsID:        last.ObsID,
+			LastSeq:          last.Seq,
 		}
 		if err := finishSourceBatch(completed, admissionFailed || ingestBuffer.Dropped() > droppedBefore,
 			func() error { return savePgSourceState(statePath, nextState) }); err != nil {

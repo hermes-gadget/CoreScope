@@ -49,7 +49,7 @@ func corePostgresFixture(t *testing.T) *sql.DB {
 	_, err = db.Exec(`
 		CREATE TABLE packets (observation_id uuid, time timestamptz, topic text,
 		  raw_hex text, snr double precision, rssi double precision, payload jsonb,
-		  rx_node_id text, network text);
+		  rx_node_id text, network text, src_node_id text, path_hashes text[], path_hash_size_bytes integer);
 		CREATE TABLE nodes (public_key text, name text);
 		CREATE TABLE ingest_observation_ledger (seq bigserial PRIMARY KEY,
 		  observation_id uuid UNIQUE, observed_at timestamptz);

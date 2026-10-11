@@ -53,7 +53,7 @@ func loadRedisSourceState(path string) (redisSourceState, bool) {
 		return redisSourceState{}, false
 	}
 	var st redisSourceState
-	if err := json.Unmarshal(raw, &st); err != nil || st.LastID == "" {
+	if err := json.Unmarshal(raw, &st); err != nil || !validRedisID(st.LastID) {
 		return redisSourceState{}, false
 	}
 	return st, true
@@ -194,9 +194,10 @@ type corePrivatePrefix struct {
 }
 
 type corePublicPolicy struct {
-	prefixes []corePrivatePrefix
-	nodes    map[string]struct{}
-	paths    map[string]struct{}
+	generation int64
+	prefixes   []corePrivatePrefix
+	nodes      map[string]struct{}
+	paths      map[string]struct{}
 }
 
 func loadCorePublicPolicy(ctx context.Context, db *sql.DB) (*corePublicPolicy, error) {
@@ -228,7 +229,7 @@ func loadCorePublicPolicy(ctx context.Context, db *sql.DB) (*corePublicPolicy, e
 	if err := json.Unmarshal(raw, &prefixes); err != nil {
 		return nil, err
 	}
-	return &corePublicPolicy{prefixes: prefixes}, nil
+	return &corePublicPolicy{generation: generation, prefixes: prefixes}, nil
 }
 
 func coreUKFamily(network string) bool {
@@ -303,6 +304,10 @@ func redisEnvelopeTimestamp(raw string) string {
 // goroutine for the process lifetime; the cursor is persisted after every
 // drained batch so a restart resumes without re-delivering.
 func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, regionSet *regionKeySet, cfg *Config, ingestBuffer *IngestBuffer, configDir string) {
+	if src.PublicVisibilityRequired() {
+		runPublicLiveSource(store, src, ingestBuffer, configDir)
+		return
+	}
 	tag := src.Name
 	if tag == "" {
 		tag = "redis"

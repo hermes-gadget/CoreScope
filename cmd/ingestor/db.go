@@ -70,9 +70,10 @@ func (s *DBStats) SnapshotBackfills() map[string]int64 {
 
 // Store wraps the SQLite database for packet ingestion.
 type Store struct {
-	db    *sql.DB
-	path  string // filesystem path to the SQLite DB (used to resolve queue dirs)
-	Stats DBStats
+	publicProjection *corePublicProjection
+	db               *sql.DB
+	path             string // filesystem path to the SQLite DB (used to resolve queue dirs)
+	Stats            DBStats
 	// plannerStatsAt is when RefreshPlannerStats last succeeded in this
 	// process, in Unix nanoseconds (0: not yet).
 	plannerStatsAt atomic.Int64

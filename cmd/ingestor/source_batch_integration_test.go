@@ -44,6 +44,12 @@ func coreFixtureJobs(t *testing.T, buffer *IngestBuffer, store *Store, messages 
 			if beforeLast != nil && i == len(messages)-1 {
 				beforeLast()
 			}
+			if store.publicProjection != nil {
+				return store.publicProjection.Batch(context.Background(), []publicProjectionRecord{{
+					ObservationID: message.ObservationID, Topic: message.Topic, Payload: []byte(message.Payload), Network: "ukmesh",
+					Tag: "complete", Source: MQTTSource{PreserveEnvelopeTime: true, MaxEnvelopePastDays: -1},
+				}})
+			}
 			return handleMessage(store, "complete", MQTTSource{PreserveEnvelopeTime: true, MaxEnvelopePastDays: -1},
 				&pgMessage{topic: message.Topic, payload: []byte(message.Payload), obsID: message.ObservationID}, nil, nil, &Config{})
 		})
@@ -53,6 +59,19 @@ func coreFixtureJobs(t *testing.T, buffer *IngestBuffer, store *Store, messages 
 		completed = append(completed, result)
 	}
 	return completed
+}
+
+func installCoreFixtureProjection(t *testing.T, store *Store) {
+	t.Helper()
+	projection, err := newCorePublicProjection(store,
+		func(context.Context) (*corePublicPolicy, error) { return &corePublicPolicy{generation: 1}, nil },
+		func(record publicProjectionRecord) error {
+			return handleMessage(store, record.Tag, record.Source, &pgMessage{topic: record.Topic, payload: record.Payload, obsID: record.ObservationID}, nil, nil, &Config{})
+		}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.publicProjection = projection
 }
 
 // This helper runs only in a child of the integration test. The parent kills
@@ -78,6 +97,7 @@ func TestF08CrashWorker(t *testing.T) {
 	if err := waitForUpstreamIdentityReady(context.Background(), store); err != nil {
 		t.Fatal(err)
 	}
+	installCoreFixtureProjection(t, store)
 	buffer := NewIngestBuffer(10)
 	buffer.Start()
 	buffer.Ready()
@@ -98,6 +118,7 @@ func TestF08CrashWorker(t *testing.T) {
 }
 
 func TestF08RealPairedSourcesCrashFailureAndRestartBothOrders(t *testing.T) {
+	resetScopeMatchCounters(t)
 	redisURL := os.Getenv("TEST_CORE_REDIS_URL")
 	u, err := url.Parse(redisURL)
 	if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") {
@@ -119,7 +140,8 @@ func TestF08RealPairedSourcesCrashFailureAndRestartBothOrders(t *testing.T) {
 	redisMessages := make([]coreSourceFixtureMessage, 0, 2)
 	lastID := ""
 	for _, id := range ids {
-		observed := time.Now().UTC().Add(-time.Minute)
+		// Both sources carry the same PostgreSQL-supported timestamp precision.
+		observed := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
 		if _, err := db.Exec(`INSERT INTO packets (observation_id, time, topic, raw_hex, network)
 		  VALUES ($1, $2, $3, $4, 'ukmesh')`, id, observed, topic, frame); err != nil {
 			t.Fatal(err)
@@ -226,6 +248,7 @@ func TestF08RealPairedSourcesCrashFailureAndRestartBothOrders(t *testing.T) {
 			if err := waitForUpstreamIdentityReady(readyCtx, store); err != nil {
 				t.Fatal(err)
 			}
+			installCoreFixtureProjection(t, store)
 			buffer := NewIngestBuffer(10)
 			buffer.Start()
 			buffer.Ready()
