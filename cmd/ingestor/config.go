@@ -633,14 +633,20 @@ func LoadConfig(path string) (*Config, error) {
 		}}
 	}
 
-	// Default MQTT source: connect to localhost broker when no sources configured
+	// Default MQTT source: connect to localhost broker when no sources configured.
+	// Skipped when postgresSources provide the feed — no spinning on a
+	// nonexistent local broker just because MQTT is unused.
 	if len(cfg.MQTTSources) == 0 {
-		cfg.MQTTSources = []MQTTSource{{
-			Name:   "local",
-			Broker: "mqtt://localhost:1883",
-			Topics: []string{"meshcore/#"},
-		}}
-		log.Printf("no MQTT sources configured, defaulting to mqtt://localhost:1883")
+		if len(cfg.PostgresSources) > 0 {
+			log.Printf("no MQTT sources configured; postgres sources present — MQTT disabled")
+		} else {
+			cfg.MQTTSources = []MQTTSource{{
+				Name:   "local",
+				Broker: "mqtt://localhost:1883",
+				Topics: []string{"meshcore/#"},
+			}}
+			log.Printf("no MQTT sources configured, defaulting to mqtt://localhost:1883")
+		}
 	}
 
 	return &cfg, nil
