@@ -101,6 +101,17 @@ func ensureObservationsDedupIndex(rw *sql.DB, logf Logger) error {
 	if !hasIdx {
 		return nil
 	}
+	// Upstream identities deliberately permit multiple observations of the
+	// same frame/observer/path. Their partial indexes are owned by the
+	// ingestor's async identity migration; recreating the broad legacy index
+	// here on restart can delete those legitimate rows before that migration.
+	upstreamIdentity, err := TableHasColumn(rw, "observations", "upstream_observation_id")
+	if err != nil {
+		return err
+	}
+	if upstreamIdentity {
+		return nil
+	}
 	// Fast path: no duplicates, so the index just builds. Atomic on its own.
 	_, err = rw.Exec(dedupIndexDDL)
 	if err == nil {

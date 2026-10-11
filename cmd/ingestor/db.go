@@ -174,11 +174,23 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 		return nil, fmt.Errorf("preparing statements: %w", err)
 	}
 	// PREFLIGHT: async=true reason="partial observation identity indexes scan 1.9M+ rows; paired historical sources wait for completion, while ordinary MQTT startup proceeds"
-	var oldIdentityIndex int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_observations_dedup'`).Scan(&oldIdentityIndex); err != nil {
+	var oldIdentityIndex, newIdentityIndexes int
+	if err := s.db.QueryRow(`SELECT
+		COUNT(*) FILTER (WHERE name = 'idx_observations_dedup'),
+		COUNT(*) FILTER (WHERE name IN ('idx_observations_dedup_legacy', 'idx_observations_upstream_id'))
+		FROM sqlite_master WHERE type='index'`).Scan(&oldIdentityIndex, &newIdentityIndexes); err != nil {
 		return nil, err
 	}
-	if oldIdentityIndex > 0 {
+	if oldIdentityIndex > 0 || newIdentityIndexes != 2 {
+		// A pre-repair boot could recreate the old index despite a done
+		// migration marker. Actual schema readiness takes precedence over it.
+		if err := ensureAsyncMigrationsTable(s.db); err != nil {
+			return nil, err
+		}
+		if _, err := s.db.Exec(`UPDATE _async_migrations SET status = 'pending_async'
+			WHERE name = 'upstream_observation_identity_v1' AND status = 'done'`); err != nil {
+			return nil, err
+		}
 		if err := s.RunAsyncMigration(context.Background(), "upstream_observation_identity_v1", func(ctx context.Context, d *sql.DB) error {
 			for _, statement := range []string{
 				`CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_dedup_legacy

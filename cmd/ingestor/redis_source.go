@@ -523,16 +523,10 @@ func runRedisSource(store *Store, src RedisSource, keySet *channelKeySet, region
 			completed = append(completed, result)
 		}
 
-		writeErr := waitTrackedIngestJobs(completed)
-		if d := ingestBuffer.Dropped() - droppedBefore; admissionFailed || decodeFailed || d > 0 || writeErr != nil {
-			log.Printf("[redis:%s] WARNING: batch incomplete (dropped=%d, writeError=%v) — cursor held for retry", tag, d, writeErr)
-			time.Sleep(time.Second)
-			continue
-		}
-
 		nextState := redisSourceState{LastID: entries[len(entries)-1].ID}
-		if err := saveRedisSourceState(statePath, nextState); err != nil {
-			log.Printf("[redis:%s] cursor save error (cursor held for retry): %v", tag, err)
+		if err := finishSourceBatch(completed, admissionFailed || decodeFailed || ingestBuffer.Dropped() > droppedBefore,
+			func() error { return saveRedisSourceState(statePath, nextState) }); err != nil {
+			log.Printf("[redis:%s] batch incomplete (cursor held for retry): %v", tag, err)
 			time.Sleep(time.Second)
 			continue
 		}

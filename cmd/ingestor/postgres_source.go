@@ -134,9 +134,11 @@ func buildPgLedgerBatchQuery(src PostgresSource, cursor pgSourceState, batchSize
        COALESCE(n.name, '') AS origin_name,
        l.observation_id::text AS obs_id, l.seq
 FROM ingest_observation_ledger l
-JOIN packets p ON p.observation_id = l.observation_id
+JOIN packets p ON p.observation_id = l.observation_id AND p.time = l.observed_at
 LEFT JOIN nodes n ON n.public_key = p.rx_node_id
-WHERE l.seq > $1 AND p.raw_hex IS NOT NULL AND p.raw_hex <> ''`)
+WHERE l.seq > $1 AND p.raw_hex IS NOT NULL AND p.raw_hex <> ''
+  AND EXISTS (SELECT 1 FROM ingest_observation_ledger_coverage
+              WHERE singleton = TRUE AND version = 1)`)
 	if len(src.Networks) > 0 {
 		args = append(args, pq.Array(src.Networks))
 		b.WriteString(fmt.Sprintf("\n  AND p.network = ANY($%d)", len(args)))
@@ -301,9 +303,14 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 		time.Sleep(5 * time.Second)
 	}
 	log.Printf("[pg:%s] connected to %s", tag, redactPgDSN(src.DSN))
-	var ledgerAvailable bool
-	if err := db.QueryRow(`SELECT to_regclass('ingest_observation_ledger') IS NOT NULL`).Scan(&ledgerAvailable); err != nil {
+	var ledgerAvailable, coverageAvailable bool
+	if err := db.QueryRow(`SELECT to_regclass('ingest_observation_ledger') IS NOT NULL,
+		to_regclass('ingest_observation_ledger_coverage') IS NOT NULL`).Scan(&ledgerAvailable, &coverageAvailable); err != nil {
 		log.Printf("[pg:%s] ERROR: ledger capability check: %v", tag, err)
+		return
+	}
+	if ledgerAvailable && !coverageAvailable {
+		log.Printf("[pg:%s] ERROR: ledger historical coverage migration 059 is required; source disabled", tag)
 		return
 	}
 	if len(cfg.RedisSources) > 0 && !ledgerAvailable {
@@ -448,21 +455,15 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 			completed = append(completed, result)
 		}
 
-		writeErr := waitTrackedIngestJobs(completed)
-		if d := ingestBuffer.Dropped() - droppedBefore; admissionFailed || d > 0 || writeErr != nil {
-			log.Printf("[pg:%s] WARNING: batch incomplete (dropped=%d, writeError=%v) — cursor held for retry", tag, d, writeErr)
-			time.Sleep(time.Second)
-			continue
-		}
-
 		last := batch[len(batch)-1]
 		nextState := pgSourceState{
 			LastTime:  last.Time.UTC().Format(time.RFC3339Nano),
 			LastObsID: last.ObsID,
 			LastSeq:   last.Seq,
 		}
-		if err := savePgSourceState(statePath, nextState); err != nil {
-			log.Printf("[pg:%s] cursor save error (cursor held for retry): %v", tag, err)
+		if err := finishSourceBatch(completed, admissionFailed || ingestBuffer.Dropped() > droppedBefore,
+			func() error { return savePgSourceState(statePath, nextState) }); err != nil {
+			log.Printf("[pg:%s] batch incomplete (cursor held for retry): %v", tag, err)
 			time.Sleep(time.Second)
 			continue
 		}

@@ -124,8 +124,13 @@ the broker:
 
 - `startTime` (RFC3339) begins a one-time backfill for a legacy UKMesh
   database without `ingest_observation_ledger`; empty = only new rows.
-  With migration 058, the committed-sequence cursor starts at zero and
-  follows ledger rows; pre-ledger packets need a separate historical backfill.
+  With migrations 058 and 059, the committed-sequence cursor starts at zero
+  and follows all retained ledger history, including pre-ledger packets.
+  Migration 059 assigns missing historical UUIDs and backfills under the
+  writer lock; its coverage fence commits atomically with the backfill.
+  The source refuses an incomplete ledger. Missing/corrupt cursor files
+  replay retained history with upstream-ID deduplication; already expired
+  PostgreSQL history cannot be recovered.
   The cursor is persisted next to the config (`pg-source-<name>.state.json`)
   after every fully-drained batch, so a restart resumes from that point.
 - `maxEnvelopePastDays` overrides the 30-day envelope past-clamp for this
@@ -202,10 +207,12 @@ visible to CoreScope without waiting for the database flush window.
 - Entries are read with plain XRANGE — readers never consume entries away from
   the upstream writer and never race other consumers.
 - Exactly one paired `postgresSources` follower is required. Against a UKMesh
-  database with `ingest_observation_ledger` (migration 058), it follows the
+  database with `ingest_observation_ledger` and its coverage fence (migrations
+  058/059), it follows the
   committed sequence rather than packet receive time, so late commits remain
   discoverable after the Redis overlap expires. Redis-only configuration is
-  rejected; a missing ledger disables the paired live source.
+  rejected; a missing ledger or coverage fence disables the completeness
+  source. An uncommitted coverage fence cannot advance a source cursor.
 - Both sources carry the upstream observation UUID into SQLite. Duplicate
   Redis/PG deliveries enrich the same row and increment observer packet counts
   once. Distinct upstream UUIDs remain distinct even with identical frame,

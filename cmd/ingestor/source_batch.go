@@ -14,3 +14,16 @@ func waitTrackedIngestJobs(results []<-chan error) error {
 	}
 	return failure
 }
+
+// Both historical sources use the same durability barrier. Saving the cursor
+// is part of completion, and is never attempted after a write/admission error.
+func finishSourceBatch(results []<-chan error, admissionFailed bool, save func() error) error {
+	err := waitTrackedIngestJobs(results)
+	if admissionFailed {
+		err = errors.Join(err, errors.New("historical source batch admission failed"))
+	}
+	if err != nil {
+		return err
+	}
+	return save()
+}
