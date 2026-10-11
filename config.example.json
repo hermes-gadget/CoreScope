@@ -221,6 +221,20 @@
       ]
     }
   ],
+  "postgresSources": [
+    {
+      "_comment": "Optional. Read MeshCore packets from an existing PostgreSQL/TimescaleDB deployment (the meshcore analytics schema: one row per observer reception in `packets`) and replay them through the same ingest pipeline as MQTT traffic. startTime (RFC3339) begins a one-time backfill when no cursor exists yet; afterwards the source follows new rows. maxEnvelopePastDays overrides the 30-day envelope past-clamp for this source (-1 = no clamp) so historical rows keep their original timestamps. networks restricts to packets.network values (empty = all). requirePublicVisibility (default true) applies the public-read guard: visibility_ok IS TRUE AND is_private IS NOT TRUE. Cursor state is persisted next to the config as pg-source-<name>.state.json.",
+      "name": "meshcore-db",
+      "dsn": "postgres://meshcore:password@timescaledb:5432/meshcore?sslmode=disable",
+      "startTime": "",
+      "pollIntervalSec": 5,
+      "batchSize": 500,
+      "maxRowsPerSec": 0,
+      "networks": [],
+      "maxEnvelopePastDays": -1,
+      "requirePublicVisibility": true
+    }
+  ],
   "channelKeys": {
     "Public": "8b3387e9c5cdea6ac9e5edbaa115cd72"
   },

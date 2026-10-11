@@ -260,18 +260,30 @@ func main() {
 	// clients are retrying in background (tracked in clients) but don't count
 	// as "connected" — a single unreachable broker must not silently run with
 	// zero active connections.
-	if connectedCount == 0 {
+	if connectedCount == 0 && len(cfg.PostgresSources) == 0 {
 		// Clean up any timed-out clients still retrying
 		for _, c := range clients {
 			c.Disconnect(0)
 		}
-		log.Fatal("no MQTT sources connected — all timed out or failed. Check broker is running (default: mqtt://localhost:1883). Set MQTT_BROKER env var or configure mqttSources in config.json")
+		log.Fatal("no sources connected — all MQTT sources timed out or failed and no postgresSources are configured. Check the broker (default: mqtt://localhost:1883) or configure mqttSources/postgresSources in config.json")
 	}
 
 	if connectedCount < len(clients) {
 		log.Printf("Running — %d MQTT source(s) connected, %d retrying in background", connectedCount, len(clients)-connectedCount)
 	} else {
 		log.Printf("Running — %d MQTT source(s) connected", connectedCount)
+	}
+
+	// Postgres sources: replay/follow packets from an existing meshcore
+	// PostgreSQL/TimescaleDB deployment. Each runs in its own goroutine for
+	// the process lifetime; its cursor is persisted after every drained
+	// batch so a restart resumes exactly where it left off.
+	for _, psrc := range cfg.PostgresSources {
+		ps := psrc
+		go runPostgresSource(store, ps, keySet, regionSet, cfg, ingestBuffer, filepath.Dir(*configPath))
+	}
+	if len(cfg.PostgresSources) > 0 {
+		log.Printf("Running — %d postgres source(s) starting", len(cfg.PostgresSources))
 	}
 
 	// Node retention: move stale nodes to inactive_nodes on startup
@@ -1036,9 +1048,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			region = source.Region
 		}
 
-		mqttMsg := &MQTTPacketMessage{Raw: rawHex}
+		mqttMsg := &MQTTPacketMessage{Raw: rawHex, PreserveTime: source.PreserveEnvelopeTime}
 		var naiveSkewSec int64
-		mqttMsg.Timestamp, naiveSkewSec = resolveRxTime(msg, tag)
+		mqttMsg.Timestamp, naiveSkewSec = resolveRxTime(msg, tag, source.MaxEnvelopePastDays)
 		if naiveSkewSec != 0 && observerID != "" {
 			// Issue #1478: record so /api/observers can surface ⚠️ chip.
 			if err := store.RecordNaiveSkew(observerID, naiveSkewSec, time.Now()); err != nil {
@@ -1186,7 +1198,15 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			// Same as the status-path call above: observer.last_seen is ingest
 			// time, not envelope time. Per-packet rxTime (stored in observations
 			// via InsertTransmission) still uses envelope time. See #1465.
-			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, ""); err != nil {
+			// Historical sources (PreserveEnvelopeTime) pass the packet's
+			// stored rx time instead so a backfill advances observers through
+			// history rather than pinning every observer to the replay run;
+			// the upsert's MAX/MIN guard keeps the value monotonic.
+			lastSeenArg := ""
+			if mqttMsg.PreserveTime {
+				lastSeenArg = mqttMsg.Timestamp
+			}
+			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, lastSeenArg); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
 			}
 		}
@@ -1600,8 +1620,13 @@ func firstNonEmpty(vals ...string) string {
 // is the signed offset in seconds (negative = observer behind UTC, positive =
 // ahead). Caller records this via Store.RecordNaiveSkew so the UI can flag
 // the observer (#1478).
-func resolveRxTime(msg map[string]interface{}, tag string) (string, int64) {
-	t, skew := resolveRxTimeCore(msg, tag)
+// resolveRxTime resolves the envelope timestamp for a packet message.
+// maxPastDays overrides the default 30-day past clamp (0 = default,
+// <0 = no past clamp) — historical sources (PostgresSource backfills) set
+// it so replayed rows keep their original times instead of being clamped
+// to ingest time.
+func resolveRxTime(msg map[string]interface{}, tag string, maxPastDays int) (string, int64) {
+	t, skew := resolveRxTimeCore(msg, tag, maxPastDays)
 	return t.Format(time.RFC3339), skew
 }
 
@@ -1625,7 +1650,7 @@ const rxTimeMillisLayout = "2006-01-02T15:04:05.000Z07:00"
 // calls this once and formats twice, instead of parsing/validating/logging
 // twice and risking two independent time.Now() reads straddling a second
 // boundary.
-func resolveRxTimeCore(msg map[string]interface{}, tag string) (time.Time, int64) {
+func resolveRxTimeCore(msg map[string]interface{}, tag string, maxPastDays int) (time.Time, int64) {
 	now := time.Now().UTC()
 	raw, _ := msg["timestamp"].(string)
 	if raw == "" {
@@ -1646,8 +1671,14 @@ func resolveRxTimeCore(msg map[string]interface{}, tag string) (time.Time, int64
 	// factory date (e.g. 2020-01-01). Such a value would permanently drag
 	// transmissions.first_seen backwards via stmtUpdateTxFirstSeen in
 	// InsertTransmission. No legitimate buffered upload is that stale.
-	if t.Before(now.Add(-30 * 24 * time.Hour)) {
-		log.Printf("MQTT [%s] stale timestamp %q (>30d old), using ingest time", tag, raw)
+	// Historical sources override the window (maxPastDays): a backfill
+	// replaying rows older than 30 days must not clamp them to ingest time.
+	limitDays := maxPastDays
+	if limitDays == 0 {
+		limitDays = 30
+	}
+	if limitDays > 0 && t.Before(now.Add(-time.Duration(limitDays)*24*time.Hour)) {
+		log.Printf("MQTT [%s] stale timestamp %q (>%dd old), using ingest time", tag, raw, limitDays)
 		return now, 0
 	}
 	// Symmetric naive-timestamp clamp (issue #1463). Naive (zone-less) ISO
