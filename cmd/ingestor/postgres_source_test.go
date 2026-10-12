@@ -83,7 +83,7 @@ func TestBuildPgBatchQuery(t *testing.T) {
 func TestF07LedgerCursorUsesCommitOrderRatherThanObservedTime(t *testing.T) {
 	cursor := pgSourceState{LastTime: "2026-10-11T17:05:00Z", LastObsID: pgZeroObsID, LastSeq: 42}
 	q, args := buildPgLedgerBatchQuery(PostgresSource{Networks: []string{"ukmesh"}}, cursor, 100)
-	for _, want := range []string{"FROM ingest_observation_ledger l", "l.seq > $1", "ORDER BY l.seq", "l.observation_id::text"} {
+	for _, want := range []string{"FROM ingest_observation_ledger l", "l.seq > $1", "ORDER BY l.seq", "c.observation_id::text", "WITH candidates AS MATERIALIZED", "CROSS JOIN LATERAL", "AND l.network = ANY($2)"} {
 		if !strings.Contains(q, want) {
 			t.Fatalf("ledger query missing %q: %s", want, q)
 		}

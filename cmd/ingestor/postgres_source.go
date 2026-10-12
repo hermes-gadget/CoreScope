@@ -133,29 +133,54 @@ type pgRow struct {
 // until the earlier writer commits or aborts. Thus a visible seq > cursor
 // cannot hide an in-flight smaller seq; gaps from aborted writes are safe.
 func buildPgLedgerBatchQuery(src PostgresSource, cursor pgSourceState, batchSize int) (string, []interface{}) {
+	// The candidate CTE is MATERIALIZED so the planner walks the ledger cursor
+	// in seq order and early-stops at the batch size, instead of hash-scanning
+	// the full ledger/packets history on every poll. Packets are then probed
+	// per candidate through a CROSS JOIN LATERAL (observation_id index).
 	var b strings.Builder
 	args := []interface{}{cursor.LastSeq}
-	b.WriteString(`SELECT p.time, p.topic, p.raw_hex, p.snr, p.rssi,
-       COALESCE(p.payload->>'direction', '') AS direction,
-       COALESCE(n.name, '') AS origin_name,
-       l.observation_id::text AS obs_id, l.seq,
-       COALESCE(p.network,''), COALESCE(p.rx_node_id,''), COALESCE(p.src_node_id,''),
-       COALESCE(p.path_hashes,ARRAY[]::text[]), COALESCE(p.path_hash_size_bytes,0)
-FROM ingest_observation_ledger l
-JOIN packets p ON p.observation_id = l.observation_id AND p.time = l.observed_at
-LEFT JOIN nodes n ON n.public_key = p.rx_node_id
-WHERE l.seq > $1 AND p.raw_hex IS NOT NULL AND p.raw_hex <> ''
-  AND EXISTS (SELECT 1 FROM ingest_observation_ledger_coverage
-              WHERE singleton = TRUE AND version = 1)`)
+	netArg := 0
+	b.WriteString(`WITH candidates AS MATERIALIZED (
+  SELECT l.observation_id, l.observed_at, l.seq
+  FROM ingest_observation_ledger l
+  WHERE l.seq > $1`)
 	if len(src.Networks) > 0 {
 		args = append(args, pq.Array(src.Networks))
-		b.WriteString(fmt.Sprintf("\n  AND p.network = ANY($%d)", len(args)))
+		netArg = len(args)
+		b.WriteString(fmt.Sprintf("\n    AND l.network = ANY($%d)", netArg))
+	}
+	args = append(args, batchSize)
+	b.WriteString(fmt.Sprintf(`
+  ORDER BY l.seq
+  LIMIT $%d
+)
+SELECT p.time, p.topic, p.raw_hex, p.snr, p.rssi,
+       COALESCE(p.payload->>'direction', '') AS direction,
+       COALESCE(n.name, '') AS origin_name,
+       c.observation_id::text AS obs_id, c.seq,
+       COALESCE(p.network,''), COALESCE(p.rx_node_id,''), COALESCE(p.src_node_id,''),
+       COALESCE(p.path_hashes,ARRAY[]::text[]), COALESCE(p.path_hash_size_bytes,0)
+FROM candidates c
+CROSS JOIN LATERAL (
+  SELECT p.* FROM packets p
+  WHERE p.observation_id = c.observation_id AND p.time = c.observed_at
+    AND p.raw_hex IS NOT NULL AND p.raw_hex <> ''`, len(args)))
+	if netArg > 0 {
+		b.WriteString(fmt.Sprintf("\n    AND p.network = ANY($%d)", netArg))
 	}
 	if src.PublicVisibilityRequired() {
-		b.WriteString(currentPublicPacketSQL)
+		b.WriteString(currentPublicLateralSQL)
 	}
-	b.WriteString(fmt.Sprintf("\nORDER BY l.seq\nLIMIT $%d", len(args)+1))
-	args = append(args, batchSize)
+	b.WriteString(`
+  LIMIT 1
+) p
+LEFT JOIN nodes n ON n.public_key = p.rx_node_id
+WHERE EXISTS (SELECT 1 FROM ingest_observation_ledger_coverage
+              WHERE singleton = TRUE AND version = 1)`)
+	if src.PublicVisibilityRequired() {
+		b.WriteString(currentPublicGlobalSQL)
+	}
+	b.WriteString("\nORDER BY c.seq")
 	return b.String(), args
 }
 
@@ -166,6 +191,29 @@ const currentPublicPacketSQL = `
   AND meshcore_path_is_valid(p.path_hashes, p.path_hash_size_bytes)
   AND NOT meshcore_path_matches_private(p.network, p.rx_node_id, p.src_node_id,
                                         p.path_hashes, p.path_hash_size_bytes)
+  AND EXISTS (
+    SELECT 1 FROM public_visibility_state current_visibility
+    JOIN packet_visibility_materialization_state materialized
+      ON materialized.singleton = current_visibility.singleton
+    WHERE current_visibility.singleton = TRUE
+      AND materialized.visibility_generation = current_visibility.generation
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM privacy_rematerialization_queue
+    WHERE status IN ('pending', 'processing', 'failed')
+  )`
+
+// currentPublicLateralSQL is the packet-level half of the current-state
+// predicate, valid inside the per-candidate lateral probe.
+const currentPublicLateralSQL = `
+    AND meshcore_path_is_valid(p.path_hashes, p.path_hash_size_bytes)
+    AND NOT meshcore_path_matches_private(p.network, p.rx_node_id, p.src_node_id,
+                                          p.path_hashes, p.path_hash_size_bytes)`
+
+// currentPublicGlobalSQL is the global half of the current-state predicate
+// (visibility generation fence and rematerialization drain), valid in the
+// outer WHERE of the ledger batch query.
+const currentPublicGlobalSQL = `
   AND EXISTS (
     SELECT 1 FROM public_visibility_state current_visibility
     JOIN packet_visibility_materialization_state materialized
@@ -347,6 +395,16 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 		}
 	default:
 		state = pgSourceState{LastTime: time.Now().UTC().Format(time.RFC3339Nano), LastObsID: pgZeroObsID}
+		if ledgerAvailable {
+			// The ledger cursor walks seq order; "follow from now" must start
+			// at the current tail, not replay the committed history.
+			if qerr := db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM ingest_observation_ledger`).Scan(&state.LastSeq); qerr != nil {
+				log.Printf("[pg:%s] ERROR: resolving ledger tail: %v", tag, qerr)
+				state.LastSeq = 0
+			} else {
+				log.Printf("[pg:%s] following from ledger seq %d", tag, state.LastSeq)
+			}
+		}
 		log.Printf("[pg:%s] no startTime — following new rows only", tag)
 	}
 
@@ -399,7 +457,12 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 				continue
 			}
 			if state.PolicyGeneration != generation {
-				state.LastSeq = 0
+				// Only a real generation *change* replays from zero. The first
+				// observation of a fresh state (0 -> N) keeps the cursor that
+				// the init above resolved (tail or startTime).
+				if state.PolicyGeneration != 0 {
+					state.LastSeq = 0
+				}
 				state.PolicyGeneration = generation
 			}
 		}
