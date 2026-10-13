@@ -29,6 +29,62 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
+// startResolverCacheRefresh primes and periodically refreshes the in-memory
+// caches that the ingest-time resolved-path writer (InsertTransmission →
+// resolvePathWithContext) depends on: the prefix index (#1547) and the
+// neighbor-graph snapshot (#1560).
+//
+// In the default (non-projection) layout both are refreshed by
+// StartNeighborEdgesBuilder's warm-up and 60s tick. Public-projection mode
+// disables that builder (its neighbor_edges writes are fenced), which
+// silently starved the resolver: the caches stayed empty, every hop resolved
+// to nil, and observations.resolved_path was never written — starving the
+// server's /api/nodes/{pk}/paths view (#1278 requires that column to
+// confirm a path). This refresher restores the caches WITHOUT writing any
+// derived table, so the projection fences stay intact.
+//
+// The warm-up is synchronous so the first InsertTransmission after boot can
+// already resolve. Errors are logged but never fatal — resolution degrades
+// to empty paths; ingest itself is unaffected.
+func startResolverCacheRefresh(store *Store, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	if err := store.RefreshPrefixIndex(); err != nil {
+		log.Printf("[resolve-caches] initial prefix-index refresh error: %v", err)
+	}
+	if err := store.RefreshNeighborGraph(); err != nil {
+		log.Printf("[resolve-caches] initial neighbor-graph refresh error: %v", err)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				if err := store.RefreshPrefixIndex(); err != nil {
+					log.Printf("[resolve-caches] prefix-index refresh error: %v", err)
+				}
+				if err := store.RefreshNeighborGraph(); err != nil {
+					log.Printf("[resolve-caches] neighbor-graph refresh error: %v", err)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
 func main() {
 	// pprof profiling — off by default, enable with ENABLE_PPROF=true
 	if os.Getenv("ENABLE_PPROF") == "true" {
@@ -732,6 +788,15 @@ func main() {
 		stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval, &neighborTrust)
 		defer stopNeighborBuilder()
 		log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
+	} else {
+		// Public-projection mode: neighbor_edges writes stay fenced off (see
+		// the !cfg.PublicProjection guards), but the resolved_path writer in
+		// InsertTransmission still needs its resolver caches — without them
+		// every hop resolves to nil and observations.resolved_path is never
+		// populated, freezing "Paths Through This Node" on the dashboard.
+		stopResolverCaches := startResolverCacheRefresh(store, NeighborEdgesBuilderInterval)
+		defer stopResolverCaches()
+		log.Printf("[resolve-caches] enabled (interval=%s, projection mode — refresh only)", NeighborEdgesBuilderInterval)
 	}
 
 	// #1212: per-source stall watchdog. Detects "silently dead" sources
