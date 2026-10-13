@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -26,6 +28,62 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
+
+// startResolverCacheRefresh primes and periodically refreshes the in-memory
+// caches that the ingest-time resolved-path writer (InsertTransmission →
+// resolvePathWithContext) depends on: the prefix index (#1547) and the
+// neighbor-graph snapshot (#1560).
+//
+// In the default (non-projection) layout both are refreshed by
+// StartNeighborEdgesBuilder's warm-up and 60s tick. Public-projection mode
+// disables that builder (its neighbor_edges writes are fenced), which
+// silently starved the resolver: the caches stayed empty, every hop resolved
+// to nil, and observations.resolved_path was never written — starving the
+// server's /api/nodes/{pk}/paths view (#1278 requires that column to
+// confirm a path). This refresher restores the caches WITHOUT writing any
+// derived table, so the projection fences stay intact.
+//
+// The warm-up is synchronous so the first InsertTransmission after boot can
+// already resolve. Errors are logged but never fatal — resolution degrades
+// to empty paths; ingest itself is unaffected.
+func startResolverCacheRefresh(store *Store, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	if err := store.RefreshPrefixIndex(); err != nil {
+		log.Printf("[resolve-caches] initial prefix-index refresh error: %v", err)
+	}
+	if err := store.RefreshNeighborGraph(); err != nil {
+		log.Printf("[resolve-caches] initial neighbor-graph refresh error: %v", err)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				if err := store.RefreshPrefixIndex(); err != nil {
+					log.Printf("[resolve-caches] prefix-index refresh error: %v", err)
+				}
+				if err := store.RefreshNeighborGraph(); err != nil {
+					log.Printf("[resolve-caches] neighbor-graph refresh error: %v", err)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
 
 func main() {
 	// pprof profiling — off by default, enable with ENABLE_PPROF=true
@@ -50,6 +108,9 @@ func main() {
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if err := cfg.ValidateCompanionSources(); err != nil {
 		log.Fatalf("config: %v", err)
 	}
 
@@ -82,7 +143,9 @@ func main() {
 	log.Printf("SQLite opened: %s", cfg.DBPath)
 
 	// Async backfill: path_json from raw_hex (#888) — must not block MQTT startup
-	store.BackfillPathJSONAsync()
+	if !cfg.PublicProjection {
+		store.BackfillPathJSONAsync()
+	}
 
 	// Soft-delete blacklisted observers (#1287 — moved from cmd/server).
 	if len(cfg.ObserverBlacklist) > 0 {
@@ -91,7 +154,9 @@ func main() {
 
 	// Async backfill: from_pubkey for legacy ADVERT rows (#1143).
 	// Moved from cmd/server in #1287. Best-effort; must not block MQTT.
-	go store.BackfillFromPubkey(5000, 100*time.Millisecond, nil)
+	if !cfg.PublicProjection {
+		go store.BackfillFromPubkey(5000, 100*time.Millisecond, nil)
+	}
 
 	// Check auto_vacuum mode and optionally migrate (#919)
 	store.CheckAutoVacuum(cfg)
@@ -131,8 +196,36 @@ func main() {
 	} else {
 		log.Printf("[regions] autoRegionKeys disabled — only the %d configured hashRegions key(s) are in force", len(regionSet.snapshot().all))
 	}
-	store.BackfillDefaultScopeAsync(regionSet)
-	store.BackfillTransportCodesAsync()
+	if !cfg.PublicProjection {
+		store.BackfillDefaultScopeAsync(regionSet)
+		store.BackfillTransportCodesAsync()
+	}
+	if cfg.PublicProjection {
+		authority, err := sql.Open("postgres", cfg.PostgresSources[0].DSN)
+		if err != nil {
+			log.Fatalf("public projection authority: %v", err)
+		}
+		defer authority.Close()
+		authority.SetMaxOpenConns(2)
+		store.publicProjection, err = newCorePublicProjection(store,
+			func(ctx context.Context) (*corePublicPolicy, error) {
+				var covered bool
+				if err := authority.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM ingest_observation_ledger_coverage WHERE singleton=TRUE AND version=1)`).Scan(&covered); err != nil {
+					return nil, err
+				}
+				if !covered {
+					return nil, errors.New("committed historical coverage is required")
+				}
+				return loadCorePublicPolicy(ctx, authority)
+			},
+			func(record publicProjectionRecord) error {
+				return handleMessage(store, record.Tag, record.Source,
+					&pgMessage{topic: record.Topic, payload: record.Payload, obsID: record.ObservationID}, keySet.Snapshot(), regionSet, cfg)
+			}, cfg.Retention.PacketDays)
+		if err != nil {
+			log.Fatalf("public projection: %v", err)
+		}
+	}
 
 	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
 	// before startup maintenance so no packets are missed while the single
@@ -140,6 +233,34 @@ func main() {
 	// messages are buffered here and drained once Ready() is called below.
 	ingestBuffer := NewIngestBuffer(cfg.IngestBufferSizeOrDefault())
 	ingestBuffer.Start()
+	if store.publicProjection != nil {
+		projectionCtx, cancelProjection := context.WithCancel(context.Background())
+		defer cancelProjection()
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-projectionCtx.Done():
+					return
+				case <-ticker.C:
+				}
+				result, accepted := ingestBuffer.SubmitTracked(func() error {
+					ctx, cancel := context.WithTimeout(projectionCtx, 10*time.Second)
+					defer cancel()
+					_, err := store.publicProjection.Refresh(ctx)
+					return err
+				})
+				if accepted {
+					select {
+					case <-projectionCtx.Done():
+						return
+					case <-result:
+					}
+				}
+			}
+		}()
+	}
 
 	// Connect to each MQTT source
 	var clients []mqtt.Client
@@ -260,12 +381,12 @@ func main() {
 	// clients are retrying in background (tracked in clients) but don't count
 	// as "connected" — a single unreachable broker must not silently run with
 	// zero active connections.
-	if connectedCount == 0 && len(cfg.PostgresSources) == 0 {
+	if connectedCount == 0 && len(cfg.PostgresSources) == 0 && len(cfg.RedisSources) == 0 {
 		// Clean up any timed-out clients still retrying
 		for _, c := range clients {
 			c.Disconnect(0)
 		}
-		log.Fatal("no sources connected — all MQTT sources timed out or failed and no postgresSources are configured. Check the broker (default: mqtt://localhost:1883) or configure mqttSources/postgresSources in config.json")
+		log.Fatal("no sources connected — all MQTT sources timed out or failed and no postgresSources are configured. Check the broker (default: mqtt://localhost:1883) or configure mqttSources/postgresSources/redisSources in config.json")
 	}
 
 	if connectedCount < len(clients) {
@@ -284,6 +405,19 @@ func main() {
 	}
 	if len(cfg.PostgresSources) > 0 {
 		log.Printf("Running — %d postgres source(s) starting", len(cfg.PostgresSources))
+	}
+
+	// Redis sources: follow the pending entries of a ukmesh RAM-first ingest
+	// stream — a live fast-path that makes new observations visible before
+	// the database flush window; the postgres follow still delivers the same
+	// observations from the database and the observation upsert collapses
+	// the duplicate. Each runs in its own goroutine with a persisted cursor.
+	for _, rsrc := range cfg.RedisSources {
+		rs := rsrc
+		go runRedisSource(store, rs, keySet, regionSet, cfg, ingestBuffer, filepath.Dir(*configPath))
+	}
+	if len(cfg.RedisSources) > 0 {
+		log.Printf("Running — %d redis source(s) starting", len(cfg.RedisSources))
 	}
 
 	// Node retention: move stale nodes to inactive_nodes on startup
@@ -379,8 +513,10 @@ func main() {
 	// Its known evidence is a lower bound: old UPSERTs erased some frames.
 	evidenceCtx, stopEvidenceBackfill := context.WithCancel(context.Background())
 	defer stopEvidenceBackfill()
-	if err := store.RunAsyncMigration(evidenceCtx, "advert_route_evidence_v1", store.backfillAdvertEvidence); err != nil {
-		log.Printf("[migration] scheduling advert evidence backfill: %v", err)
+	if !cfg.PublicProjection {
+		if err := store.RunAsyncMigration(evidenceCtx, "advert_route_evidence_v1", store.backfillAdvertEvidence); err != nil {
+			log.Printf("[migration] scheduling advert evidence backfill: %v", err)
+		}
 	}
 	if d := ingestBuffer.Dropped(); d > 0 {
 		log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
@@ -648,9 +784,20 @@ func main() {
 	// path-trust threshold. Resolved once here so every tick shares the
 	// same operator-configured value.
 	neighborTrust := cfg.GetPathTrust()
-	stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval, &neighborTrust)
-	defer stopNeighborBuilder()
-	log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
+	if !cfg.PublicProjection {
+		stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval, &neighborTrust)
+		defer stopNeighborBuilder()
+		log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
+	} else {
+		// Public-projection mode: neighbor_edges writes stay fenced off (see
+		// the !cfg.PublicProjection guards), but the resolved_path writer in
+		// InsertTransmission still needs its resolver caches — without them
+		// every hop resolves to nil and observations.resolved_path is never
+		// populated, freezing "Paths Through This Node" on the dashboard.
+		stopResolverCaches := startResolverCacheRefresh(store, NeighborEdgesBuilderInterval)
+		defer stopResolverCaches()
+		log.Printf("[resolve-caches] enabled (interval=%s, projection mode — refresh only)", NeighborEdgesBuilderInterval)
+	}
 
 	// #1212: per-source stall watchdog. Detects "silently dead" sources
 	// where the client reports connected but no messages have flowed. Logs
@@ -833,13 +980,14 @@ func buildForceReconnectFn(client mqtt.Client, tag string) func() {
 	}
 }
 
-func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) {
+func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) (writeErr error) {
 	// Liveness watchdog (#1212): record receipt before any processing so a
 	// slow handler still counts as "source is alive". Cheap atomic store.
 	markLivenessForTag(tag, time.Now())
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("MQTT [%s] panic in handler: %v", tag, r)
+			writeErr = errors.Join(writeErr, fmt.Errorf("ingest handler panic: %v", r))
 		}
 	}()
 
@@ -1043,6 +1191,13 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		if len(parts) > 1 {
 			region = clampObserverField(parts[1], maxObserverIATALen)
 		}
+		upstreamObservationID := ""
+		if sourceMessage, ok := m.(interface{ ObservationID() string }); ok {
+			upstreamObservationID = sourceMessage.ObservationID()
+			if upstreamObservationID == pgZeroObsID {
+				upstreamObservationID = ""
+			}
+		}
 		// Fallback to source-level region config when topic has no region (#788)
 		if region == "" && source.Region != "" {
 			region = source.Region
@@ -1055,6 +1210,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			// Issue #1478: record so /api/observers can surface ⚠️ chip.
 			if err := store.RecordNaiveSkew(observerID, naiveSkewSec, time.Now()); err != nil {
 				log.Printf("MQTT [%s] RecordNaiveSkew(%s): %v", tag, observerID, err)
+				writeErr = errors.Join(writeErr, err)
 			}
 		}
 		// Parse optional region from JSON payload (#788)
@@ -1096,6 +1252,19 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		if v, ok := msg["origin"].(string); ok {
 			mqttMsg.Origin = v
 		}
+		acceptedObservation := false
+		prepareSourceObserver := func() error {
+			if !source.PreserveEnvelopeTime || observerID == "" {
+				return nil
+			}
+			effectiveRegion := region
+			if mqttMsg.Region != "" {
+				effectiveRegion = mqttMsg.Region
+			}
+			return store.upsertObserverAtCount(observerID,
+				clampObserverField(mqttMsg.Origin, maxObserverTextLen), effectiveRegion,
+				nil, mqttMsg.Timestamp, 0)
+		}
 
 		// For ADVERT packets with known coordinates, enforce geo_filter before
 		// storing anything — drop the entire message if outside the area.
@@ -1114,7 +1283,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 				}
 				log.Printf("MQTT [%s] DROPPED invalid signature: hash=%s name=%s observer=%s pubkey=%s",
 					tag, hash, sanitizeLogString(decoded.Payload.Name), sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)), truncPK)
-				store.InsertDroppedPacket(&DroppedPacket{
+				if err := store.InsertDroppedPacket(&DroppedPacket{
 					Hash:         hash,
 					RawHex:       rawHex,
 					Reason:       "invalid signature",
@@ -1122,7 +1291,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					ObserverName: mqttMsg.Origin,
 					NodePubKey:   decoded.Payload.PubKey,
 					NodeName:     decoded.Payload.Name,
-				})
+				}); err != nil {
+					writeErr = errors.Join(writeErr, err)
+				}
 				return
 			}
 			foreign := false
@@ -1147,47 +1318,74 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			}
 			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
 			pktData.Foreign = foreign
+			pktData.UpstreamObservationID = upstreamObservationID
+			if err := prepareSourceObserver(); err != nil {
+				return err
+			}
 			isNew, err := store.InsertTransmission(pktData)
 			if err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
+			} else {
+				acceptedObservation = pktData.ObservationInserted
 			}
 			role := advertRole(decoded.Payload.Flags)
 			if err := store.UpsertNode(decoded.Payload.PubKey, decoded.Payload.Name, role, decoded.Payload.Lat, decoded.Payload.Lon, pktData.Timestamp); err != nil {
 				log.Printf("MQTT [%s] node upsert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
 			}
 			if foreign {
 				if err := store.MarkNodeForeign(decoded.Payload.PubKey); err != nil {
 					log.Printf("MQTT [%s] mark foreign error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 			if isNew {
 				if err := store.IncrementAdvertCount(decoded.Payload.PubKey); err != nil {
 					log.Printf("MQTT [%s] advert count error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 			// Update telemetry if present in advert
 			if decoded.Payload.BatteryMv != nil || decoded.Payload.TemperatureC != nil {
 				if err := store.UpdateNodeTelemetry(decoded.Payload.PubKey, decoded.Payload.BatteryMv, decoded.Payload.TemperatureC); err != nil {
 					log.Printf("MQTT [%s] node telemetry update error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 			// Update default_scope when advert carries a matched transport scope (#899, #1534)
 			if shouldUpdateDefaultScope(pktData) {
 				if err := store.UpdateNodeDefaultScope(decoded.Payload.PubKey, pktData.ScopeName); err != nil {
 					log.Printf("MQTT [%s] node default_scope update error: %v", tag, err)
+					writeErr = errors.Join(writeErr, err)
 				}
 			}
 		} else {
 			// Non-ADVERT packets: store normally (routing/channel messages from
 			// in-area observers are relevant regardless of relay hop origin).
 			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
+			pktData.UpstreamObservationID = upstreamObservationID
+			if err := prepareSourceObserver(); err != nil {
+				return err
+			}
 			if _, err := store.InsertTransmission(pktData); err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
+			} else {
+				acceptedObservation = pktData.ObservationInserted
 			}
 		}
 
 		// Upsert observer
 		if observerID != "" {
+			if source.PreserveEnvelopeTime {
+				if acceptedObservation {
+					if err := store.IncrementObserverPacketCount(observerID); err != nil {
+						writeErr = errors.Join(writeErr, err)
+					}
+				}
+				return
+			}
 			origin, _ := msg["origin"].(string)
 			origin = clampObserverField(origin, maxObserverTextLen)
 			// Use effective region: payload > topic > source config (#788)
@@ -1208,6 +1406,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			}
 			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, lastSeenArg); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
+				writeErr = errors.Join(writeErr, err)
 			}
 		}
 
@@ -1405,6 +1604,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		log.Print(formatDirectMessageLog(tag, firstNonEmpty(sender, "unknown")))
 		return
 	}
+	return
 }
 
 func toFloat64(v interface{}) (float64, bool) {

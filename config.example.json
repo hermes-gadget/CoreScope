@@ -235,6 +235,18 @@
       "requirePublicVisibility": true
     }
   ],
+  "redisSources": [
+    {
+      "_comment": "Optional. Follow the pending (not-yet-committed) entries of a ukmesh RAM-first ingest stream — a live fast-path ahead of the postgresSources follow. Entries carry admission-time visibility flags; requirePublicVisibility (default true) filters to public ones. The stream only holds entries awaiting the database flush; a reader never consumes entries (plain XRANGE, no consumer group) and commits never remove data from this source. Requires the upstream ukmesh deployment to run MQTT_INGEST_MODE=ram. Cursor state is persisted next to the config as redis-source-<name>.state.json.",
+      "name": "ukmesh-live",
+      "url": "redis://:password@redis:6379",
+      "streamKey": "meshcore:ingest:pending",
+      "pollIntervalMs": 500,
+      "batchSize": 500,
+      "networks": ["ukmesh"],
+      "requirePublicVisibility": true
+    }
+  ],
   "channelKeys": {
     "Public": "8b3387e9c5cdea6ac9e5edbaa115cd72"
   },

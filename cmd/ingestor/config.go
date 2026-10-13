@@ -64,9 +64,8 @@ type PostgresSource struct {
 	MaxRowsPerSec int `json:"maxRowsPerSec,omitempty"`
 	// Networks restricts to packets.network values (empty = all networks).
 	Networks []string `json:"networks,omitempty"`
-	// RequirePublicVisibility (default true) applies the public-read guard:
-	// visibility_ok IS TRUE AND is_private IS NOT TRUE. Disable only for
-	// private deployments.
+	// RequirePublicVisibility (default true) requires current authority and a
+	// dedicated revocable projection. Disable only for private deployments.
 	RequirePublicVisibility *bool `json:"requirePublicVisibility,omitempty"`
 	// MaxEnvelopePastDays overrides the 30-day past clamp applied to
 	// envelope timestamps for this source (0 = default, <0 = no clamp).
@@ -89,7 +88,7 @@ func (p PostgresSource) PollIntervalOrDefault() int {
 // BatchSizeOrDefault returns the rows fetched per query, or 500 if not set.
 func (p PostgresSource) BatchSizeOrDefault() int {
 	if p.BatchSize > 0 {
-		return p.BatchSize
+		return min(p.BatchSize, 2000)
 	}
 	return 500
 }
@@ -98,6 +97,72 @@ func (p PostgresSource) BatchSizeOrDefault() int {
 // (default true).
 func (p PostgresSource) PublicVisibilityRequired() bool {
 	return p.RequirePublicVisibility == nil || *p.RequirePublicVisibility
+}
+
+// RedisSource reads pending (not-yet-committed) packet observations from a
+// ukmesh RAM-first ingest stream — the live fast-path ahead of the
+// postgresSources database follow (see redis_source.go).
+type RedisSource struct {
+	PublicURL   string `json:"publicURL,omitempty"`
+	PublicToken string `json:"publicToken,omitempty"`
+	Name        string `json:"name"`
+	// URL is a redis:// connection URL, e.g. redis://:password@redis:6379.
+	URL string `json:"url"`
+	// Password overrides the password embedded in URL when set.
+	Password string `json:"password,omitempty"`
+	// Legacy private-source option. Public sources reject this raw credential.
+	PrivacyDSN string `json:"privacyDsn,omitempty"`
+	// StreamKey is the stream name (default meshcore:ingest:pending).
+	StreamKey string `json:"streamKey,omitempty"`
+	// PollIntervalMs is the delay between polls for new entries (default 500).
+	PollIntervalMs int `json:"pollIntervalMs,omitempty"`
+	// BatchSize is entries read per poll (default 500).
+	BatchSize int `json:"batchSize,omitempty"`
+	// Networks restricts entries to matching network values (empty = all).
+	Networks []string `json:"networks,omitempty"`
+	// RequirePublicVisibility (default true) requires the credentialed public
+	// HTTP source and revocable projection. Disable only for private deployments.
+	RequirePublicVisibility *bool `json:"requirePublicVisibility,omitempty"`
+	// MaxEnvelopePastDays overrides the 30-day past clamp applied to envelope
+	// timestamps for this source (0 = default, <0 = no clamp).
+	MaxEnvelopePastDays int `json:"maxEnvelopePastDays,omitempty"`
+	// StatePath overrides where the cursor is persisted (default:
+	// redis-source-<name>.state.json next to the config file).
+	StatePath string `json:"statePath,omitempty"`
+	// MaxRowsPerSec throttles ingest (0 = unlimited).
+	MaxRowsPerSec int `json:"maxRowsPerSec,omitempty"`
+}
+
+// PollIntervalMsOrDefault returns the per-source poll interval in
+// milliseconds, or 500 if not set.
+func (r RedisSource) PollIntervalMsOrDefault() int {
+	if r.PollIntervalMs > 0 {
+		return r.PollIntervalMs
+	}
+	return 500
+}
+
+// BatchSizeOrDefault returns entries fetched per read, or 500 if not set.
+func (r RedisSource) BatchSizeOrDefault() int {
+	if r.BatchSize > 0 {
+		return min(r.BatchSize, 2000)
+	}
+	return 500
+}
+
+// StreamKeyOrDefault returns the stream name, or the ukmesh RAM ingest
+// default if not set.
+func (r RedisSource) StreamKeyOrDefault() string {
+	if r.StreamKey != "" {
+		return r.StreamKey
+	}
+	return "meshcore:ingest:pending"
+}
+
+// PublicVisibilityRequired reports whether the public-read guard applies
+// (default true).
+func (r RedisSource) PublicVisibilityRequired() bool {
+	return r.RequirePublicVisibility == nil || *r.RequirePublicVisibility
 }
 
 // ConnectTimeoutOrDefault returns the per-source connect timeout in seconds,
@@ -117,12 +182,16 @@ type MQTTLegacy struct {
 
 // Config holds the ingestor configuration, compatible with the Node.js config.json format.
 type Config struct {
-	DBPath      string       `json:"dbPath"`
-	MQTT        *MQTTLegacy  `json:"mqtt,omitempty"`
-	MQTTSources []MQTTSource `json:"mqttSources,omitempty"`
+	PublicProjection bool         `json:"publicProjection,omitempty"`
+	DBPath           string       `json:"dbPath"`
+	MQTT             *MQTTLegacy  `json:"mqtt,omitempty"`
+	MQTTSources      []MQTTSource `json:"mqttSources,omitempty"`
 	// PostgresSources read packets from an existing meshcore PostgreSQL /
 	// TimescaleDB deployment (backfill + follow) — see postgres_source.go.
-	PostgresSources      []PostgresSource            `json:"postgresSources,omitempty"`
+	PostgresSources []PostgresSource `json:"postgresSources,omitempty"`
+	// RedisSources read pending observations from a ukmesh RAM-first ingest
+	// stream (live fast-path ahead of the postgres follow) — see redis_source.go.
+	RedisSources         []RedisSource               `json:"redisSources,omitempty"`
 	LogLevel             string                      `json:"logLevel,omitempty"`
 	ChannelKeysPath      string                      `json:"channelKeysPath,omitempty"`
 	ChannelKeys          map[string]string           `json:"channelKeys,omitempty"`
@@ -188,6 +257,40 @@ type Config struct {
 	// ingestor reads: where users.db is and whether approved hashtag channels
 	// are decrypted. Everything else in the block belongs to the server.
 	UserManagement *UserManagementConfig `json:"userManagement,omitempty"`
+}
+
+// A Redis stream is a bounded live tail, never a completeness source.
+func (c *Config) ValidateCompanionSources() error {
+	public := false
+	for _, source := range c.PostgresSources {
+		public = public || source.PublicVisibilityRequired()
+	}
+	for _, source := range c.RedisSources {
+		public = public || source.PublicVisibilityRequired()
+	}
+	if public && !c.PublicProjection {
+		return fmt.Errorf("public UKMesh sources require publicProjection and a dedicated revocable database")
+	}
+	if c.PublicProjection {
+		if len(c.PostgresSources) != 1 || !c.PostgresSources[0].PublicVisibilityRequired() || len(c.MQTTSources) > 0 {
+			return fmt.Errorf("publicProjection requires one public PostgreSQL source and no MQTT sources")
+		}
+		if c.Retention == nil || c.Retention.PacketDays < 1 {
+			return fmt.Errorf("publicProjection requires positive retention.packetDays")
+		}
+		for _, source := range c.RedisSources {
+			if !source.PublicVisibilityRequired() || source.PublicURL == "" || source.PublicToken == "" || source.URL != "" || source.PrivacyDSN != "" {
+				return fmt.Errorf("public Redis tail requires publicURL/publicToken and must not receive raw Redis credentials")
+			}
+		}
+	}
+	if len(c.RedisSources) == 0 {
+		return nil
+	}
+	if len(c.PostgresSources) != 1 {
+		return fmt.Errorf("redisSources requires exactly one paired postgresSources completeness follower")
+	}
+	return nil
 }
 
 // NeighborEdgesDaysOrDefault returns the configured pruning window or 5.
@@ -644,8 +747,8 @@ func LoadConfig(path string) (*Config, error) {
 		}}
 	}
 
-	// Default MQTT source: connect to localhost broker when no sources configured
-	if len(cfg.MQTTSources) == 0 {
+	// Public projections exclusively replay their authorized upstream source.
+	if len(cfg.MQTTSources) == 0 && !cfg.PublicProjection {
 		cfg.MQTTSources = []MQTTSource{{
 			Name:   "local",
 			Broker: "mqtt://localhost:1883",

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -14,12 +15,13 @@ import (
 
 // Hub manages WebSocket clients and broadcasts.
 type Hub struct {
-	mu             sync.RWMutex
-	clients        map[*Client]bool
-	upgrader       websocket.Upgrader
-	allowedOrigins []string   // exact-match allowlist for /ws CheckOrigin (see SetAllowedOrigins)
-	limits         *wsLimiter // #1794: per-IP caps and deny list; nil allows everything
-	pingInterval   time.Duration
+	publicProjection *publicProjectionReader
+	mu               sync.RWMutex
+	clients          map[*Client]bool
+	upgrader         websocket.Upgrader
+	allowedOrigins   []string   // exact-match allowlist for /ws CheckOrigin (see SetAllowedOrigins)
+	limits           *wsLimiter // #1794: per-IP caps and deny list; nil allows everything
+	pingInterval     time.Duration
 }
 
 // SetAllowedOrigins configures the exact-match origin allowlist consulted by
@@ -81,6 +83,7 @@ var wsHeartbeat = []byte(`{"type":"heartbeat"}`)
 
 // Client is a single WebSocket connection.
 type Client struct {
+	writeMu   sync.Mutex
 	conn      *websocket.Conn
 	send      chan []byte
 	closeOnce sync.Once
@@ -172,6 +175,9 @@ func (h *Hub) Close() {
 
 // Broadcast sends a message to all connected clients.
 func (h *Hub) Broadcast(msg interface{}) {
+	if h.publicProjection != nil {
+		return
+	} // Public measurements require a captured generation.
 	data, err := json.Marshal(msg)
 	if err != nil {
 		log.Printf("[ws] marshal error: %v", err)
@@ -190,6 +196,12 @@ func (h *Hub) Broadcast(msg interface{}) {
 
 // ServeWS handles the WebSocket upgrade and runs the client.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
+	if h.publicProjection != nil {
+		if _, err := h.publicProjection.epoch(r.Context()); err != nil {
+			http.Error(w, "public data temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	// #1794: decide BEFORE the upgrade. Rejecting afterwards would already
 	// have allocated the connection and completed the handshake, which is the
 	// resource this is meant to protect.
@@ -263,17 +275,23 @@ func (c *Client) writePump(pingInterval time.Duration) {
 	for {
 		select {
 		case message, ok := <-c.send:
+			c.writeMu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.writeMu.Unlock()
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				c.writeMu.Unlock()
 				return
 			}
+			c.writeMu.Unlock()
 		case <-ticker.C:
+			c.writeMu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				c.writeMu.Unlock()
 				return
 			}
 			// #1074: the ping above keeps proxies and this server's read
@@ -281,8 +299,10 @@ func (c *Client) writePump(pingInterval time.Duration) {
 			// frame the page receives, a quiet mesh and a dead socket look the
 			// same to the client, so it could not detect the latter.
 			if err := c.conn.WriteMessage(websocket.TextMessage, wsHeartbeat); err != nil {
+				c.writeMu.Unlock()
 				return
 			}
+			c.writeMu.Unlock()
 		}
 	}
 }
@@ -322,6 +342,30 @@ func (p *Poller) Start() {
 	for {
 		select {
 		case <-ticker.C:
+			var generation int64
+			var publicBatch []WSMessage
+			if reader := p.hub.publicProjection; reader != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				var err error
+				generation, err = reader.epoch(ctx)
+				cancel()
+				if err != nil {
+					continue
+				}
+				if _, err = reader.routesFor(generation); err != nil {
+					continue
+				}
+				reader.mu.Lock()
+				p.store = reader.store
+				reader.mu.Unlock()
+			}
+			broadcast := func(message WSMessage) {
+				if generation > 0 {
+					publicBatch = append(publicBatch, message)
+				} else {
+					p.hub.Broadcast(message)
+				}
+			}
 			if p.store != nil {
 				// Ingest new transmissions into in-memory store and broadcast
 				newTxs, newMax := p.store.IngestNewFromDB(lastID, 100)
@@ -347,13 +391,13 @@ func (p *Poller) Start() {
 					log.Printf("[broadcast] sending %d packets to %d clients (lastID now %d)", len(newTxs), p.hub.ClientCount(), lastID)
 				}
 				for _, tx := range newTxs {
-					p.hub.Broadcast(WSMessage{
+					broadcast(WSMessage{
 						Type: "packet",
 						Data: tx,
 					})
 				}
 				for _, obs := range newObs {
-					p.hub.Broadcast(WSMessage{
+					broadcast(WSMessage{
 						Type: "packet",
 						Data: obs,
 					})
@@ -376,11 +420,14 @@ func (p *Poller) Start() {
 						pkt[k] = v
 					}
 					tx["packet"] = pkt
-					p.hub.Broadcast(WSMessage{
+					broadcast(WSMessage{
 						Type: "packet",
 						Data: tx,
 					})
 				}
+			}
+			if generation > 0 {
+				p.hub.BroadcastPublicBatch(publicBatch, generation)
 			}
 		case <-p.stop:
 			return
