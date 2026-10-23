@@ -37,7 +37,7 @@ func handleClientRfSample(store *Store, tag, rxPubkey string, msg map[string]int
 		return
 	}
 
-	rxTime, _ := resolveRxTimeCore(msg, tag)
+	rxTime, _ := resolveRxTimeCore(msg, tag, 0)
 	sampledAt := rxTime.Format(rxTimeMillisLayout)
 
 	o := &ClientRfSample{

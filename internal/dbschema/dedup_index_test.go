@@ -76,6 +76,25 @@ func TestEnsureObservationsDedupIndexOnCleanTable(t *testing.T) {
 	}
 }
 
+func TestF17UpstreamIdentitySurvivesSchemaReapply(t *testing.T) {
+	db := observationsDB(t)
+	if _, err := db.Exec(`ALTER TABLE observations ADD COLUMN upstream_observation_id TEXT;
+		INSERT INTO observations (transmission_id, observer_idx, path_json, timestamp, upstream_observation_id)
+		VALUES (1, 1, '[]', 10, 'first'), (1, 1, '[]', 10, 'second')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureObservationsDedupIndex(db, t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || dedupIndexExists(t, db) {
+		t.Fatalf("schema reapply collapsed upstream identities or rebuilt the legacy constraint: count=%d", count)
+	}
+}
+
 // The in-transaction DROP only matters on the success path: on failure ROLLBACK
 // removes the temp table regardless. Replacing that DROP with a no-op survived
 // every other test here, because none of them looked at the temp schema after a

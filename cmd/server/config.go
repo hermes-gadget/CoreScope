@@ -37,10 +37,14 @@ type ListLimitsConfig struct {
 
 // Config mirrors the Node.js config.json structure (read-only fields).
 type Config struct {
-	Port       int               `json:"port"`
-	APIKey     string            `json:"apiKey"`
-	DBPath     string            `json:"dbPath"`
-	ListLimits *ListLimitsConfig `json:"listLimits"`
+	PrivateUpstreamDeployment bool              `json:"privateUpstreamDeployment,omitempty"`
+	PublicProjection          bool              `json:"publicProjection,omitempty"`
+	PublicAuthorityURL        string            `json:"publicAuthorityURL,omitempty"`
+	PublicAuthorityToken      string            `json:"publicAuthorityToken,omitempty"`
+	Port                      int               `json:"port"`
+	APIKey                    string            `json:"apiKey"`
+	DBPath                    string            `json:"dbPath"`
+	ListLimits                *ListLimitsConfig `json:"listLimits"`
 
 	// NodeBlacklist is a list of public keys to exclude from all API responses.
 	// Blacklisted nodes are hidden from node lists, search, detail, map, and stats.

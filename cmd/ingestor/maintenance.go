@@ -71,6 +71,11 @@ func (s *Store) PruneOldPackets(days int) (int64, error) {
 		return 0, nil
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
+	if s.publicProjection != nil {
+		if _, err := s.db.Exec(`DELETE FROM public_projection_journal WHERE observed_at < ?`, cutoff); err != nil {
+			return 0, err
+		}
+	}
 
 	var total int64
 	for {

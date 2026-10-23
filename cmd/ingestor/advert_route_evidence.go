@@ -17,6 +17,7 @@ const insertAdvertEvidenceSQL = `INSERT INTO advert_route_evidence(tx_id,bit)
 // conflict, so the caller skips it. Only an uncheckpointed old row needs work.
 const legacyAdvertObservationSQL = `SELECT raw_hex FROM observations
 	WHERE transmission_id=? AND observer_idx=? AND COALESCE(path_json,'')=?
+	AND upstream_observation_id IS NULL
 	AND id > COALESCE((SELECT obs_cursor FROM advert_evidence_backfill WHERE id=1),0)`
 
 // Caller holds writerMu, including through the subsequent observation UPSERT.
