@@ -72,7 +72,9 @@ func (s *DBStats) SnapshotBackfills() map[string]int64 {
 type Store struct {
 	publicProjection *corePublicProjection
 	db               *sql.DB
-	path             string // filesystem path to the SQLite DB (used to resolve queue dirs)
+	ingestDB         ingestSQL // base pool, or a transaction-scoped replay executor
+	replayTx         *sql.Tx   // non-nil only on a private replay Store; writerMu is already held
+	path             string    // filesystem path to the SQLite DB (used to resolve queue dirs)
 	Stats            DBStats
 	// plannerStatsAt is when RefreshPlannerStats last succeeded in this
 	// process, in Unix nanoseconds (0: not yet).
@@ -170,7 +172,7 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 		return nil, fmt.Errorf("dbschema.Apply: %w", err)
 	}
 
-	s := &Store{db: db, path: dbPath, sampleIntervalSec: sampleIntervalSec}
+	s := &Store{db: db, ingestDB: db, path: dbPath, sampleIntervalSec: sampleIntervalSec}
 	if err := s.prepareStatements(); err != nil {
 		return nil, fmt.Errorf("preparing statements: %w", err)
 	}
@@ -974,21 +976,21 @@ func applySchema(db *sql.DB) error {
 
 func (s *Store) prepareStatements() error {
 	var err error
-	s.stmtInsertAdvertEvidence, err = s.db.Prepare(insertAdvertEvidenceSQL)
+	s.stmtInsertAdvertEvidence, err = s.ingestDB.Prepare(insertAdvertEvidenceSQL)
 	if err != nil {
 		return err
 	}
-	s.stmtGetLegacyAdvertObservation, err = s.db.Prepare(legacyAdvertObservationSQL)
-	if err != nil {
-		return err
-	}
-
-	s.stmtGetTxByHash, err = s.db.Prepare("SELECT id, first_seen FROM transmissions WHERE hash = ?")
+	s.stmtGetLegacyAdvertObservation, err = s.ingestDB.Prepare(legacyAdvertObservationSQL)
 	if err != nil {
 		return err
 	}
 
-	s.stmtInsertTransmission, err = s.db.Prepare(`
+	s.stmtGetTxByHash, err = s.ingestDB.Prepare("SELECT id, first_seen FROM transmissions WHERE hash = ?")
+	if err != nil {
+		return err
+	}
+
+	s.stmtInsertTransmission, err = s.ingestDB.Prepare(`
 		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash, scope_name, from_pubkey, last_seen, code1, code2)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
@@ -996,7 +998,7 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtUpdateTxFirstSeen, err = s.db.Prepare("UPDATE transmissions SET first_seen = ? WHERE id = ?")
+	s.stmtUpdateTxFirstSeen, err = s.ingestDB.Prepare("UPDATE transmissions SET first_seen = ? WHERE id = ?")
 	if err != nil {
 		return err
 	}
@@ -1010,18 +1012,18 @@ func (s *Store) prepareStatements() error {
 	// backfill completes. Recorded in _migrations under
 	// "tx_last_seen_backfill_v1".
 	// PREFLIGHT: async=true reason="prepared-statement row-level UPDATE BY PRIMARY KEY (transmissions.id) — single-row touch per observation, indexed by PK, constant-time at any scale. Not a migration."
-	s.stmtTouchNodeLastSeen, err = s.db.Prepare(
+	s.stmtTouchNodeLastSeen, err = s.ingestDB.Prepare(
 		"UPDATE nodes SET last_seen = ? WHERE public_key = ? AND (last_seen IS NULL OR last_seen < ?)")
 	if err != nil {
 		return fmt.Errorf("preparing touch node last_seen: %w", err)
 	}
 
-	s.stmtBumpTxLastSeen, err = s.db.Prepare("UPDATE transmissions SET last_seen = ? WHERE id = ? AND last_seen < ?")
+	s.stmtBumpTxLastSeen, err = s.ingestDB.Prepare("UPDATE transmissions SET last_seen = ? WHERE id = ? AND last_seen < ?")
 	if err != nil {
 		return err
 	}
 
-	s.stmtInsertObservation, err = s.db.Prepare(`
+	s.stmtInsertObservation, err = s.ingestDB.Prepare(`
 		-- The upstream UUID is immutable. A second source may fill absent RF
 		-- measurements/raw/path resolution, but cannot re-key an observation or
 		-- replace a non-null value already accepted from the first source.
@@ -1038,7 +1040,7 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtUpsertNode, err = s.db.Prepare(`
+	s.stmtUpsertNode, err = s.ingestDB.Prepare(`
 		INSERT INTO nodes (public_key, name, role, lat, lon, last_seen, first_seen)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(public_key) DO UPDATE SET
@@ -1052,14 +1054,14 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtIncrementAdvertCount, err = s.db.Prepare(`
+	s.stmtIncrementAdvertCount, err = s.ingestDB.Prepare(`
 		UPDATE nodes SET advert_count = advert_count + 1 WHERE public_key = ?
 	`)
 	if err != nil {
 		return err
 	}
 
-	s.stmtUpsertObserver, err = s.db.Prepare(`
+	s.stmtUpsertObserver, err = s.ingestDB.Prepare(`
 		INSERT INTO observers (id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, can_relay, can_relay_seen)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), CASE WHEN ? IS NULL THEN 0 ELSE 1 END)
 		ON CONFLICT(id) DO UPDATE SET
@@ -1081,7 +1083,7 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtGetObserverRowid, err = s.db.Prepare("SELECT rowid FROM observers WHERE id = ?")
+	s.stmtGetObserverRowid, err = s.ingestDB.Prepare("SELECT rowid FROM observers WHERE id = ?")
 	if err != nil {
 		return err
 	}
@@ -1089,7 +1091,7 @@ func (s *Store) prepareStatements() error {
 	// Args: ingestNow, rxTime, ingestNow, rxTime, rowid
 	// MIN(existing, ingestNow) clamps any future value already in the DB before
 	// taking MAX with rxTime, so the guard never locks in a past bug's stale future.
-	s.stmtUpdateObserverLastSeen, err = s.db.Prepare(`
+	s.stmtUpdateObserverLastSeen, err = s.ingestDB.Prepare(`
 		UPDATE observers SET
 			last_seen      = MAX(MIN(COALESCE(last_seen, ''), ?), ?),
 			last_packet_at = MAX(MIN(COALESCE(last_packet_at, ''), ?), ?)
@@ -1098,7 +1100,7 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtUpdateNodeTelemetry, err = s.db.Prepare(`
+	s.stmtUpdateNodeTelemetry, err = s.ingestDB.Prepare(`
 		UPDATE nodes SET
 			battery_mv = COALESCE(?, battery_mv),
 			temperature_c = COALESCE(?, temperature_c)
@@ -1108,7 +1110,7 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtUpsertMetrics, err = s.db.Prepare(`
+	s.stmtUpsertMetrics, err = s.ingestDB.Prepare(`
 		INSERT OR REPLACE INTO observer_metrics (observer_id, timestamp, noise_floor, tx_air_secs, rx_air_secs, recv_errors, battery_mv, packets_sent, packets_recv)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
@@ -1133,14 +1135,16 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	// other writer (vacuum, prune, neighbor-builder) and the wait is
 	// Go-visible.
 	mqttWaitStart := time.Now()
-	writerMu.Lock()
-	mqttWait := time.Since(mqttWaitStart)
-	mqttHoldStart := time.Now()
-	defer func() {
-		mqttHold := time.Since(mqttHoldStart)
-		writerMu.Unlock()
-		recordWriterTiming("mqtt_handler", mqttWait, mqttHold, "InsertTransmission")
-	}()
+	if s.replayTx == nil {
+		writerMu.Lock()
+		mqttWait := time.Since(mqttWaitStart)
+		mqttHoldStart := time.Now()
+		defer func() {
+			mqttHold := time.Since(mqttHoldStart)
+			writerMu.Unlock()
+			recordWriterTiming("mqtt_handler", mqttWait, mqttHold, "InsertTransmission")
+		}()
+	}
 
 	rxTime := data.Timestamp
 	ingestNow := time.Now().UTC().Format(time.RFC3339)
@@ -1260,10 +1264,10 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	observationExisted := false
 	if data.UpstreamObservationID != "" {
 		var one int
-		observationExisted = s.db.QueryRow(`SELECT 1 FROM observations WHERE upstream_observation_id = ?`, data.UpstreamObservationID).Scan(&one) == nil
+		observationExisted = s.ingestDB.QueryRow(`SELECT 1 FROM observations WHERE upstream_observation_id = ?`, data.UpstreamObservationID).Scan(&one) == nil
 	} else if observerIdx != nil {
 		var one int
-		observationExisted = s.db.QueryRow(`SELECT 1 FROM observations
+		observationExisted = s.ingestDB.QueryRow(`SELECT 1 FROM observations
 			WHERE transmission_id = ? AND observer_idx = ? AND COALESCE(path_json, '') = COALESCE(?, '')
 			AND upstream_observation_id IS NULL`, txID, *observerIdx, data.PathJSON).Scan(&one) == nil
 	}
@@ -1334,7 +1338,7 @@ func (s *Store) MarkNodeForeign(pubKey string) error {
 	if pubKey == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`UPDATE nodes SET foreign_advert = 1 WHERE public_key = ?`, pubKey)
+	_, err := s.ingestDB.Exec(`UPDATE nodes SET foreign_advert = 1 WHERE public_key = ?`, pubKey)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
 	}
@@ -1416,12 +1420,12 @@ func (s *Store) upsertObserverAtCount(id, name, iata string, meta *ObserverMeta,
 	s.Stats.ObserverUpserts.Add(1)
 
 	// Reactivate if this observer was previously marked inactive
-	s.db.Exec(`UPDATE observers SET inactive = 0 WHERE id = ? AND inactive = 1`, id)
+	s.ingestDB.Exec(`UPDATE observers SET inactive = 0 WHERE id = ? AND inactive = 1`, id)
 	return nil
 }
 
 func (s *Store) IncrementObserverPacketCount(id string) error {
-	_, err := s.db.Exec(`UPDATE observers SET packet_count = packet_count + 1 WHERE id = ?`, id)
+	_, err := s.ingestDB.Exec(`UPDATE observers SET packet_count = packet_count + 1 WHERE id = ?`, id)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
 	}
@@ -1445,7 +1449,7 @@ func (s *Store) UpsertObserverRetained(id, name, iata string, meta *ObserverMeta
 	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
 	model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay := observerMetaColumns(meta)
 
-	_, err := s.db.Exec(`
+	_, err := s.ingestDB.Exec(`
 		UPDATE observers SET
 			name = COALESCE(?, name),
 			iata = COALESCE(?, iata),
@@ -2306,7 +2310,7 @@ type DroppedPacket struct {
 
 // InsertDroppedPacket records a rejected packet in the dropped_packets table.
 func (s *Store) InsertDroppedPacket(dp *DroppedPacket) error {
-	_, err := s.db.Exec(
+	_, err := s.ingestDB.Exec(
 		`INSERT INTO dropped_packets (hash, raw_hex, reason, observer_id, observer_name, node_pubkey, node_name) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		dp.Hash, dp.RawHex, dp.Reason, dp.ObserverID, dp.ObserverName, dp.NodePubKey, dp.NodeName,
 	)
@@ -2406,15 +2410,15 @@ func (s *Store) UpdateNodeDefaultScope(pubkey, scope string) error {
 	}
 	// Short-circuit: skip if already stored.
 	var cur sql.NullString
-	row := s.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey)
+	row := s.ingestDB.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey)
 	if row.Scan(&cur) == nil && cur.Valid && cur.String == scope {
 		return nil
 	}
-	if _, err := s.db.Exec(`UPDATE nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey); err != nil {
+	if _, err := s.ingestDB.Exec(`UPDATE nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey); err != nil {
 		return err
 	}
 	// Mirror to inactive_nodes (node may be there if recently moved by retention).
-	_, err := s.db.Exec(`UPDATE inactive_nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey)
+	_, err := s.ingestDB.Exec(`UPDATE inactive_nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey)
 	return err
 }
 
@@ -2513,18 +2517,18 @@ func (s *Store) UpdateNodeConfiguredScope(pubkey, scope, reportedAt string) erro
 	// Last-write-wins: skip if the stored confirmation is newer-or-equal.
 	if reportedAt != "" {
 		var curAt sql.NullString
-		row := s.db.QueryRow(`SELECT configured_scope_at FROM nodes WHERE public_key = ?`, pubkey)
+		row := s.ingestDB.QueryRow(`SELECT configured_scope_at FROM nodes WHERE public_key = ?`, pubkey)
 		if row.Scan(&curAt) == nil && curAt.Valid && curAt.String != "" && curAt.String >= reportedAt {
 			return nil
 		}
 	}
-	if _, err := s.db.Exec(
+	if _, err := s.ingestDB.Exec(
 		`UPDATE nodes SET configured_scope = ?, configured_scope_at = ? WHERE public_key = ?`,
 		scope, reportedAt, pubkey); err != nil {
 		return err
 	}
 	// Mirror to inactive_nodes (node may be there if recently moved by retention).
-	_, err := s.db.Exec(
+	_, err := s.ingestDB.Exec(
 		`UPDATE inactive_nodes SET configured_scope = ?, configured_scope_at = ? WHERE public_key = ?`,
 		scope, reportedAt, pubkey)
 	return err
@@ -2548,7 +2552,7 @@ func (s *Store) RecordNaiveSkew(observerID string, deltaSec int64, now time.Time
 	// One INSERT-or-UPDATE round trip. ON CONFLICT path resets the rolling
 	// counter when the previous event is older than the 24h window, otherwise
 	// increments it.
-	_, err := s.db.Exec(`
+	_, err := s.ingestDB.Exec(`
 		INSERT INTO observers (id, clock_skew_seconds, clock_skew_count_24h, clock_last_naive_at)
 		VALUES (?, ?, 1, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -2910,6 +2914,9 @@ var writerMu sync.Mutex
 // WriterExec wraps s.db.Exec with per-component wait/hold/contention
 // instrumentation (issue #1340).
 func (s *Store) WriterExec(component, query string, args ...interface{}) (sql.Result, error) {
+	if s.replayTx != nil {
+		return s.replayTx.Exec(query, args...)
+	}
 	waitStart := time.Now()
 	writerMu.Lock()
 	wait := time.Since(waitStart)
@@ -2924,6 +2931,9 @@ func (s *Store) WriterExec(component, query string, args ...interface{}) (sql.Re
 // WriterTx wraps Begin → fn → Commit under component tagging.
 // hold_ms covers the whole tx so a slow body counts against its owner.
 func (s *Store) WriterTx(component string, fn func(*sql.Tx) error) error {
+	if s.replayTx != nil {
+		return fn(s.replayTx)
+	}
 	waitStart := time.Now()
 	writerMu.Lock()
 	wait := time.Since(waitStart)

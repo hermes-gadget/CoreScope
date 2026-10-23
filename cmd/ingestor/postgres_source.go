@@ -133,6 +133,37 @@ type pgRow struct {
 // allocates ledger sequences. A later writer cannot allocate/commit its seq
 // until the earlier writer commits or aborts. Thus a visible seq > cursor
 // cannot hide an in-flight smaller seq; gaps from aborted writes are safe.
+// Use the first eligible sequence, not MAX(expired seq): ledger commit order
+// and observation time can differ. Empty retained history starts at the tail
+// so future late arrivals still pass the committed-order cursor.
+func buildPgRetentionCursorQuery(src PostgresSource, cutoff time.Time) (string, []interface{}) {
+	query := `SELECT COALESCE(MIN(seq) - 1,
+  (SELECT COALESCE(MAX(seq), 0) FROM ingest_observation_ledger))
+FROM ingest_observation_ledger WHERE observed_at >= $1`
+	args := []interface{}{cutoff}
+	if len(src.Networks) > 0 {
+		query += ` AND network = ANY($2)`
+		args = append(args, pq.Array(src.Networks))
+	}
+	return query, args
+}
+
+func pgPolicyCursor(state pgSourceState, generation int64, fingerprint string, cutoff time.Time,
+	seek func(time.Time) (int64, error)) (pgSourceState, error) {
+	if state.PolicyGeneration != generation {
+		if state.PolicyGeneration != 0 && state.PolicyFingerprint != "" && state.PolicyFingerprint != fingerprint {
+			seq, err := seek(cutoff)
+			if err != nil {
+				return state, err
+			}
+			state.LastSeq = seq
+		}
+		state.PolicyGeneration = generation
+	}
+	state.PolicyFingerprint = fingerprint
+	return state, nil
+}
+
 func buildPgLedgerBatchQuery(src PostgresSource, cursor pgSourceState, batchSize int) (string, []interface{}) {
 	// The candidate CTE is MATERIALIZED so the planner walks the ledger cursor
 	// in seq order and early-stops at the batch size, instead of hash-scanning
@@ -458,22 +489,22 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 				continue
 			}
 			fingerprint := store.publicProjection.Fingerprint()
-			if state.PolicyGeneration != generation {
-				// Re-read the ledger from zero only when the visibility rules
-				// actually changed. Generation bumps that leave
-				// private_node_prefixes identical (FK-cascade node deletes,
-				// zero-row statements) used to force a full 7M-row replay —
-				// ~58h at 34 rows/s — for no policy change. An empty stored
-				// fingerprint is an older state file: adopt the baseline
-				// rather than risk a needless replay.
-				reset := state.PolicyGeneration != 0 &&
-					state.PolicyFingerprint != "" && state.PolicyFingerprint != fingerprint
-				if reset {
-					state.LastSeq = 0
-				}
-				state.PolicyGeneration = generation
+			next, err := pgPolicyCursor(state, generation, fingerprint,
+				time.Now().UTC().AddDate(0, 0, -cfg.Retention.PacketDays), func(cutoff time.Time) (int64, error) {
+					seekCtx, cancelSeek := context.WithTimeout(context.Background(), 90*time.Second)
+					defer cancelSeek()
+					query, args := buildPgRetentionCursorQuery(src, cutoff)
+					var seq int64
+					err := db.QueryRowContext(seekCtx, query, args...).Scan(&seq)
+					return seq, err
+				})
+			if err != nil {
+				status.MarkDisconnect(time.Now(), err)
+				log.Printf("[pg:%s] retention cursor unavailable; cursor held: %v", tag, err)
+				time.Sleep(time.Second)
+				continue
 			}
-			state.PolicyFingerprint = fingerprint
+			state = next
 		}
 		var query string
 		var args []interface{}

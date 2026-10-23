@@ -26,9 +26,7 @@ func TestF01CopiedDerivedProjectionRevokesAndReplaysAfterFailure(t *testing.T) {
 			return nil, errors.New("authority unavailable")
 		}
 		return policy, nil
-	}, func(record publicProjectionRecord) error {
-		return handleMessage(store, record.Tag, record.Source, &pgMessage{topic: record.Topic, payload: record.Payload, obsID: record.ObservationID}, nil, nil, &Config{})
-	}, 30)
+	}, applyReplayFixture, 30)
 	if err != nil {
 		t.Fatal(err)
 	}

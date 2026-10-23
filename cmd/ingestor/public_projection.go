@@ -98,13 +98,13 @@ type corePublicProjection struct {
 	mu            sync.Mutex
 	store         *Store
 	loadPolicy    func(context.Context) (*corePublicPolicy, error)
-	apply         func(publicProjectionRecord) error
+	apply         func(*Store, publicProjectionRecord) error
 	retentionDays int
 	fingerprint   string // privacy-rule digest behind the last completed refresh
 }
 
 func newCorePublicProjection(store *Store, load func(context.Context) (*corePublicPolicy, error),
-	apply func(publicProjectionRecord) error, retentionDays int) (*corePublicProjection, error) {
+	apply func(*Store, publicProjectionRecord) error, retentionDays int) (*corePublicProjection, error) {
 	if retentionDays < 1 {
 		return nil, errors.New("public projection requires positive packet retention")
 	}
@@ -239,7 +239,7 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 	// Page the private journal rather than retaining all history in memory.
 	var cursor int64
 	for {
-		rows, err := p.store.db.Query(`SELECT id,record FROM public_projection_journal WHERE id>? ORDER BY id LIMIT 256`, cursor)
+		rows, err := p.store.db.Query(`SELECT id,record FROM public_projection_journal WHERE id>? ORDER BY id LIMIT ?`, cursor, publicProjectionReplayBatchSize)
 		if err != nil {
 			return err
 		}
@@ -247,7 +247,7 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 			id     int64
 			record publicProjectionRecord
 		}
-		batch := make([]saved, 0, 256)
+		batch := make([]saved, 0, publicProjectionReplayBatchSize)
 		for rows.Next() {
 			var item saved
 			var raw []byte
@@ -269,16 +269,21 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 		if len(batch) == 0 {
 			break
 		}
-		for _, item := range batch {
-			if policy.allows(item.record.participant()) {
-				if err := p.apply(item.record); err != nil {
+		if err := p.store.withProjectionReplayTx(context.Background(), func(target *Store) error {
+			for _, item := range batch {
+				if policy.allows(item.record.participant()) {
+					if err := p.apply(target, item.record); err != nil {
+						return err
+					}
+				} else if _, err := target.ingestDB.Exec(`DELETE FROM public_projection_journal WHERE id=?`, item.id); err != nil {
 					return err
 				}
-			} else if _, err := p.store.db.Exec(`DELETE FROM public_projection_journal WHERE id=?`, item.id); err != nil {
-				return err
 			}
-			cursor = item.id
+			return nil
+		}); err != nil {
+			return err
 		}
+		cursor = batch[len(batch)-1].id
 	}
 	if err := p.store.backfillAdvertEvidence(context.Background(), p.store.db); err != nil {
 		return err
@@ -389,7 +394,7 @@ func (p *corePublicProjection) Batch(ctx context.Context, records []publicProjec
 		allowed = append(allowed, record)
 	}
 	for _, record := range allowed {
-		if err := p.apply(record); err != nil {
+		if err := p.apply(p.store, record); err != nil {
 			return err
 		}
 	}

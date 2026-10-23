@@ -218,8 +218,8 @@ func main() {
 				}
 				return loadCorePublicPolicy(ctx, authority)
 			},
-			func(record publicProjectionRecord) error {
-				return handleMessage(store, record.Tag, record.Source,
+			func(target *Store, record publicProjectionRecord) error {
+				return handleMessage(target, record.Tag, record.Source,
 					&pgMessage{topic: record.Topic, payload: record.Payload, obsID: record.ObservationID}, keySet.Snapshot(), regionSet, cfg)
 			}, cfg.Retention.PacketDays)
 		if err != nil {

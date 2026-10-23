@@ -127,7 +127,7 @@ func (s *Store) UpsertClientObserver(pubkey, name, ts string) error {
 	if pubkey == "" || name == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`
+	_, err := s.ingestDB.Exec(`
 		INSERT INTO client_observers (pubkey, name, last_seen) VALUES (?,?,?)
 		ON CONFLICT(pubkey) DO UPDATE SET name = excluded.name, last_seen = excluded.last_seen`,
 		strings.ToLower(pubkey), name, ts)
@@ -255,7 +255,7 @@ func buildClientReception(
 // UNIQUE(rx_pubkey, heard_key, rx_at) constraint; returns ins=false when the
 // row already existed. All writes live in the ingestor (read/write invariant #1283).
 func (s *Store) InsertClientReception(r *ClientReception) (bool, error) {
-	res, err := s.db.Exec(`
+	res, err := s.ingestDB.Exec(`
 		INSERT INTO client_receptions
 			(rx_pubkey, heard_key, heard_keylen, rssi, snr, lat, lon, pos_acc_m, rx_at, ingested_at, src)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -293,7 +293,7 @@ type ClientRfSample struct {
 // server derives deltas, so a lost or reordered sample costs one interval
 // rather than corrupting a running total.
 func (s *Store) InsertClientRfSample(o *ClientRfSample) (bool, error) {
-	res, err := s.db.Exec(`
+	res, err := s.ingestDB.Exec(`
 		INSERT INTO client_rf_samples
 			(rx_pubkey, sampled_at, ingested_at, lat, lon, pos_acc_m, stationary,
 			 uptime_secs, battery_mv, queue_len, errors, noise_floor, last_rssi,
@@ -413,7 +413,7 @@ func buildClientRxObservation(
 // Several rows per pkt_hash are EXPECTED — each is one forwarder's copy of the
 // same flood, and that multiplicity is the flood-amplification signal.
 func (s *Store) InsertClientRxObservation(o *ClientRxObservation) (bool, error) {
-	res, err := s.db.Exec(`
+	res, err := s.ingestDB.Exec(`
 		INSERT INTO client_rx_observations
 			(rx_pubkey, rx_at, ingested_at, pkt_hash, route_type, payload_type,
 			 code1, code2, scope_name, hash_size, hop_count, path_json, forwarder,
@@ -455,7 +455,7 @@ type ClientDeclaredRegions struct {
 // Idempotent via UNIQUE(target, rx_pubkey, observed_at); returns ins=false
 // when the row already existed.
 func (s *Store) InsertClientDeclaredRegions(o *ClientDeclaredRegions) (bool, error) {
-	res, err := s.db.Exec(`
+	res, err := s.ingestDB.Exec(`
 		INSERT INTO node_declared_regions
 			(target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon, pos_acc_m, repeater_clock)
 		VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -475,7 +475,7 @@ func (s *Store) InsertClientDeclaredRegions(o *ClientDeclaredRegions) (bool, err
 // overwrite a fresher one.
 func (s *Store) CurrentDeclaredRegions(target string) (*ClientDeclaredRegions, error) {
 	target = strings.ToLower(strings.TrimSpace(target))
-	row := s.db.QueryRow(`
+	row := s.ingestDB.QueryRow(`
 		SELECT target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon, pos_acc_m, repeater_clock
 		FROM node_declared_regions
 		WHERE target = ?
