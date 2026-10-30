@@ -94,6 +94,54 @@ The ingestor reads these fields from the existing `config.json`:
   - `clientId`: optional MQTT ClientID. Default `corescope-<name>-<random>`, new suffix per ingestor start. Two running ingestors must not share a value on one broker
 - `mqtt` — legacy single-broker config (auto-converted to `mqttSources`)
 - `dbPath` — SQLite DB path (default: `data/meshcore.db`)
+- `postgresSources[]` — read packets from an existing meshcore
+  PostgreSQL/TimescaleDB deployment (backfill + follow); see below
+
+### Postgres source (backfill + follow)
+
+Optional. Reads MeshCore packets from an existing PostgreSQL/TimescaleDB
+deployment that stores one row per observer reception (the meshcore
+analytics `packets` schema) and replays them through the same ingest
+pipeline as MQTT traffic. Use it to seed a new analyzer from an existing
+deployment's history and/or to keep it fed from the database instead of
+the broker:
+
+```json
+"postgresSources": [
+  {
+    "name": "meshcore-db",
+    "dsn": "postgres://meshcore:password@timescaledb:5432/meshcore?sslmode=disable",
+    "startTime": "2026-09-10T00:00:00Z",
+    "pollIntervalSec": 5,
+    "batchSize": 500,
+    "maxRowsPerSec": 0,
+    "networks": ["ukmesh"],
+    "maxEnvelopePastDays": -1,
+    "requirePublicVisibility": true
+  }
+]
+```
+
+- `startTime` (RFC3339) begins a one-time backfill for a legacy UKMesh
+  database without `ingest_observation_ledger`; empty = only new rows.
+  With migrations 058 and 059, the committed-sequence cursor starts at zero
+  and follows all retained ledger history, including pre-ledger packets.
+  Migration 059 assigns missing historical UUIDs and backfills under the
+  writer lock; its coverage fence commits atomically with the backfill.
+  The source refuses an incomplete ledger. Missing/corrupt cursor files
+  replay retained history with upstream-ID deduplication; already expired
+  PostgreSQL history cannot be recovered.
+  The cursor is persisted next to the config (`pg-source-<name>.state.json`)
+  after every fully-drained batch, so a restart resumes from that point.
+- `maxEnvelopePastDays` overrides the 30-day envelope past-clamp for this
+  source (`-1` = no clamp) so historical rows keep their original times.
+- `requirePublicVisibility` (default true) applies the current UKMesh
+  observer/source/path policy and generation/rematerialization fence. Frozen
+  packet visibility flags do not grant access.
+- `networks` restricts to `packets.network` values (empty = all).
+- The source paces itself on the ingest buffer and never advances its
+  cursor past rows that have not drained, so backfills cannot silently
+  lose history.
 
 ## Test
 
@@ -146,4 +194,47 @@ cmd/ingestor/
   config.go        — config struct + loader
   util.go          — shared utilities
   go.mod / go.sum  — Go module definition
+```
+
+## Redis live source (ukmesh RAM-first ingest)
+
+`redisSources[]` follows the *pending* entries of a ukmesh RAM-first ingest
+stream (`MQTT_INGEST_MODE=ram` upstream): validated packets are admitted to a
+bounded Redis stream at broker-acknowledgement time and persisted to
+PostgreSQL moments later, so following the stream makes new observations
+visible to CoreScope without waiting for the database flush window.
+
+- Entries are read with plain XRANGE — readers never consume entries away from
+  the upstream writer and never race other consumers.
+- Exactly one paired `postgresSources` follower is required. Against a UKMesh
+  database with `ingest_observation_ledger` and its coverage fence (migrations
+  058/059), it follows the
+  committed sequence rather than packet receive time, so late commits remain
+  discoverable after the Redis overlap expires. Redis-only configuration is
+  rejected; a missing ledger or coverage fence disables the completeness
+  source. An uncommitted coverage fence cannot advance a source cursor.
+- Both sources carry the upstream observation UUID into SQLite. Duplicate
+  Redis/PG deliveries enrich the same row and increment observer packet counts
+  once. Distinct upstream UUIDs remain distinct even with identical frame,
+  observer and path values.
+- `requirePublicVisibility` (default true) checks current UKMesh
+  observer/source/path policy and its materialization fence per batch. Set
+  `privacyDsn` on the Redis source if it differs from the paired PG DSN.
+  Admission-time `vo` is not treated as current permission. Already copied
+  CoreScope derived data still needs an explicit revocation/rebuild path after
+  an upstream public-to-private policy change; do not treat this integration
+  as a fully authorized public mirror until that path is in place.
+- Cursor (last stream ID) persists next to the config as
+  `redis-source-<name>.state.json`; a restart resumes without replay.
+
+```json
+"redisSources": [
+  {
+    "name": "ukmesh-live",
+    "url": "redis://:password@redis:6379",
+    "pollIntervalMs": 500,
+    "batchSize": 500,
+    "requirePublicVisibility": true
+  }
+]
 ```

@@ -29,16 +29,18 @@ const memBreakdownNote = "Per-component *MB count string content + one Go string
 
 // Server holds shared state for route handlers.
 type Server struct {
-	db        *DB
-	cfg       *Config
-	hub       *Hub
-	store     *PacketStore // in-memory packet store (nil = fallback to DB)
-	configDir string       // directory containing config.json (for write-back via PUT /api/config/geo-filter)
-	startedAt time.Time
-	perfStats *PerfStats
-	version   string
-	commit    string
-	buildTime string
+	publicProjection *publicProjectionReader
+	projectionChild  bool
+	db               *DB
+	cfg              *Config
+	hub              *Hub
+	store            *PacketStore // in-memory packet store (nil = fallback to DB)
+	configDir        string       // directory containing config.json (for write-back via PUT /api/config/geo-filter)
+	startedAt        time.Time
+	perfStats        *PerfStats
+	version          string
+	commit           string
+	buildTime        string
 
 	// Cached runtime.MemStats to avoid stop-the-world pauses on every health check
 	memStatsMu       sync.Mutex
@@ -242,27 +244,46 @@ func (s *Server) setGeoFilter(gf *GeoFilterConfig) {
 // RegisterRoutes sets up all HTTP routes on the given router.
 func (s *Server) RegisterRoutes(r *mux.Router) {
 	s.router = r
-	// CORS middleware (must run before route handlers)
-	r.Use(s.corsMiddleware)
+	if !s.projectionChild && s.db != nil && s.db.conn != nil {
+		var installed int
+		_ = s.db.conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='public_projection_state'`).Scan(&installed)
+		if !s.cfg.PrivateUpstreamDeployment {
+			var copied bool
+			if err := s.db.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM observations WHERE upstream_observation_id IS NOT NULL LIMIT 1)`).Scan(&copied); err == nil && copied {
+				installed = 1
+			}
+		}
+		if s.cfg.PublicProjection || installed > 0 {
+			s.publicProjection = newPublicProjectionReader(s)
+			if s.hub != nil {
+				s.hub.publicProjection = s.publicProjection
+			}
+			r.Use(s.publicProjection.middleware)
+		}
+	}
+	if !s.projectionChild {
+		// CORS middleware (must run before route handlers)
+		r.Use(s.corsMiddleware)
 
-	// Performance instrumentation middleware
-	r.Use(s.perfMiddleware)
+		// Performance instrumentation middleware
+		r.Use(s.perfMiddleware)
 
-	// /api/* responses must not be cached by upstream CDNs (#1551).
-	// Cloudflare/nginx/Varnish default zone policies cache
-	// application/json for 15min–4h when no Cache-Control is set,
-	// causing operators behind a CDN to serve stale observers/packets/
-	// stats data. Scope: /api/ prefix only — static assets stay
-	// CDN-cacheable (their headers are set by spaHandler).
-	r.Use(noStoreAPIMiddleware)
+		// /api/* responses must not be cached by upstream CDNs (#1551).
+		// Cloudflare/nginx/Varnish default zone policies cache
+		// application/json for 15min–4h when no Cache-Control is set,
+		// causing operators behind a CDN to serve stale observers/packets/
+		// stats data. Scope: /api/ prefix only — static assets stay
+		// CDN-cacheable (their headers are set by spaHandler).
+		r.Use(noStoreAPIMiddleware)
 
-	// Detect CDN-fronted deployments and warn the operator ONCE if
-	// any CDN-typical header (CF-Ray, CF-Connecting-IP, etc.) is
-	// observed. See #1561: no-store alone isn't sufficient on
-	// Cloudflare zones with Cache Rules / Page Rules that ignore
-	// origin Cache-Control. Operator must add a Bypass Cache rule
-	// for /api/* — see docs/deployment-behind-cdn.md.
-	r.Use(cdnDetectionMiddleware)
+		// Detect CDN-fronted deployments and warn the operator ONCE if
+		// any CDN-typical header (CF-Ray, CF-Connecting-IP, etc.) is
+		// observed. See #1561: no-store alone isn't sufficient on
+		// Cloudflare zones with Cache Rules / Page Rules that ignore
+		// origin Cache-Control. Operator must add a Bypass Cache rule
+		// for /api/* — see docs/deployment-behind-cdn.md.
+		r.Use(cdnDetectionMiddleware)
+	}
 
 	// Optional user management: routes exist only when the feature is on.
 	if s.auth != nil {

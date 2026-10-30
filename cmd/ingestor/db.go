@@ -70,9 +70,10 @@ func (s *DBStats) SnapshotBackfills() map[string]int64 {
 
 // Store wraps the SQLite database for packet ingestion.
 type Store struct {
-	db    *sql.DB
-	path  string // filesystem path to the SQLite DB (used to resolve queue dirs)
-	Stats DBStats
+	publicProjection *corePublicProjection
+	db               *sql.DB
+	path             string // filesystem path to the SQLite DB (used to resolve queue dirs)
+	Stats            DBStats
 	// plannerStatsAt is when RefreshPlannerStats last succeeded in this
 	// process, in Unix nanoseconds (0: not yet).
 	plannerStatsAt atomic.Int64
@@ -172,6 +173,42 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 	s := &Store{db: db, path: dbPath, sampleIntervalSec: sampleIntervalSec}
 	if err := s.prepareStatements(); err != nil {
 		return nil, fmt.Errorf("preparing statements: %w", err)
+	}
+	// PREFLIGHT: async=true reason="partial observation identity indexes scan 1.9M+ rows; paired historical sources wait for completion, while ordinary MQTT startup proceeds"
+	var oldIdentityIndex, newIdentityIndexes int
+	if err := s.db.QueryRow(`SELECT
+		COUNT(*) FILTER (WHERE name = 'idx_observations_dedup'),
+		COUNT(*) FILTER (WHERE name IN ('idx_observations_dedup_legacy', 'idx_observations_upstream_id'))
+		FROM sqlite_master WHERE type='index'`).Scan(&oldIdentityIndex, &newIdentityIndexes); err != nil {
+		return nil, err
+	}
+	if oldIdentityIndex > 0 || newIdentityIndexes != 2 {
+		// A pre-repair boot could recreate the old index despite a done
+		// migration marker. Actual schema readiness takes precedence over it.
+		if err := ensureAsyncMigrationsTable(s.db); err != nil {
+			return nil, err
+		}
+		if _, err := s.db.Exec(`UPDATE _async_migrations SET status = 'pending_async'
+			WHERE name = 'upstream_observation_identity_v1' AND status = 'done'`); err != nil {
+			return nil, err
+		}
+		if err := s.RunAsyncMigration(context.Background(), "upstream_observation_identity_v1", func(ctx context.Context, d *sql.DB) error {
+			for _, statement := range []string{
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_dedup_legacy
+				 ON observations(transmission_id, observer_idx, COALESCE(path_json, ''))
+				 WHERE upstream_observation_id IS NULL`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_upstream_id
+				 ON observations(upstream_observation_id) WHERE upstream_observation_id IS NOT NULL`,
+				`DROP INDEX IF EXISTS idx_observations_dedup`,
+			} {
+				if _, err := d.ExecContext(ctx, statement); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("scheduling upstream identity migration: %w", err)
+		}
 	}
 
 	// Continue the scope-match tally from where the previous process left
@@ -492,15 +529,26 @@ func applySchema(db *sql.DB) error {
 				rssi REAL,
 				score INTEGER,
 				path_json TEXT,
-				timestamp INTEGER NOT NULL
+				timestamp INTEGER NOT NULL,
+				upstream_observation_id TEXT
 			);
 			CREATE INDEX idx_observations_transmission_id ON observations(transmission_id);
 			CREATE INDEX idx_observations_observer_idx ON observations(observer_idx);
 			CREATE INDEX idx_observations_timestamp ON observations(timestamp);
-			CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_dedup ON observations(transmission_id, observer_idx, COALESCE(path_json, ''));
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_dedup_legacy
+			  ON observations(transmission_id, observer_idx, COALESCE(path_json, ''))
+			  WHERE upstream_observation_id IS NULL;
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_upstream_id
+			  ON observations(upstream_observation_id) WHERE upstream_observation_id IS NOT NULL;
 		`
 		if _, err := db.Exec(obs); err != nil {
 			return fmt.Errorf("observations schema: %w", err)
+		}
+	}
+	if obsExists {
+		// PREFLIGHT: async=true reason="SQLite ADD COLUMN is metadata-only; the row-scanning indexes are scheduled separately after startup"
+		if _, err := db.Exec(`ALTER TABLE observations ADD COLUMN upstream_observation_id TEXT`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("upstream observation identity column: %w", err)
 		}
 	}
 
@@ -974,9 +1022,12 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtInsertObservation, err = s.db.Prepare(`
-		INSERT INTO observations (transmission_id, observer_idx, direction, snr, rssi, score, path_json, timestamp, raw_hex, resolved_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(transmission_id, observer_idx, COALESCE(path_json, '')) DO UPDATE SET
+		-- The upstream UUID is immutable. A second source may fill absent RF
+		-- measurements/raw/path resolution, but cannot re-key an observation or
+		-- replace a non-null value already accepted from the first source.
+		INSERT INTO observations (transmission_id, observer_idx, direction, snr, rssi, score, path_json, timestamp, raw_hex, resolved_path, upstream_observation_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO UPDATE SET
 			snr           = COALESCE(excluded.snr,           snr),
 			rssi          = COALESCE(excluded.rssi,          rssi),
 			score         = COALESCE(excluded.score,         score),
@@ -1010,12 +1061,12 @@ func (s *Store) prepareStatements() error {
 
 	s.stmtUpsertObserver, err = s.db.Prepare(`
 		INSERT INTO observers (id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, can_relay, can_relay_seen)
-		VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), CASE WHEN ? IS NULL THEN 0 ELSE 1 END)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), CASE WHEN ? IS NULL THEN 0 ELSE 1 END)
 		ON CONFLICT(id) DO UPDATE SET
 			name = COALESCE(?, name),
 			iata = COALESCE(?, iata),
 			last_seen = MAX(MIN(COALESCE(last_seen, ''), ?), ?),
-			packet_count = packet_count + 1,
+			packet_count = packet_count + ?,
 			model = COALESCE(?, model),
 			firmware = COALESCE(?, firmware),
 			client_version = COALESCE(?, client_version),
@@ -1108,7 +1159,10 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		// Existing transmission
 		txID = existingID
 		if rxTime < existingFirstSeen {
-			_, _ = s.stmtUpdateTxFirstSeen.Exec(rxTime, txID)
+			if _, err := s.stmtUpdateTxFirstSeen.Exec(rxTime, txID); err != nil {
+				s.Stats.WriteErrors.Add(1)
+				return false, fmt.Errorf("update transmission first_seen: %w", err)
+			}
 		}
 	} else {
 		// New transmission
@@ -1155,10 +1209,20 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		if err == nil {
 			observerIdx = &rowid
 			// observer.last_seen and last_packet_at answer "when did the analyzer
-			// last hear from this observer" — both are ingest-time questions.
-			// Per-packet rxTime is stored separately on observations/transmissions
-			// using envelope time (see InsertTransmission above). See #1465.
-			_, _ = s.stmtUpdateObserverLastSeen.Exec(ingestNow, ingestNow, ingestNow, ingestNow, rowid)
+			// last hear from this observer". For live sources that is ingest
+			// time (#1465). Historical sources (data.PreserveTime) use the
+			// stored rxTime as the monotonic floor so a backfill advances
+			// observers through history instead of pinning them to the replay
+			// run; the MAX/MIN guard never lets either value move backwards
+			// or into the future.
+			obsFloor := ingestNow
+			if data.PreserveTime {
+				obsFloor = rxTime
+			}
+			if _, err := s.stmtUpdateObserverLastSeen.Exec(ingestNow, obsFloor, ingestNow, obsFloor, rowid); err != nil {
+				s.Stats.WriteErrors.Add(1)
+				return false, fmt.Errorf("update observer last_seen: %w", err)
+			}
 		}
 	}
 
@@ -1193,17 +1257,30 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	)
 	resolvedJSON := marshalResolvedPath(resolved)
 
+	observationExisted := false
+	if data.UpstreamObservationID != "" {
+		var one int
+		observationExisted = s.db.QueryRow(`SELECT 1 FROM observations WHERE upstream_observation_id = ?`, data.UpstreamObservationID).Scan(&one) == nil
+	} else if observerIdx != nil {
+		var one int
+		observationExisted = s.db.QueryRow(`SELECT 1 FROM observations
+			WHERE transmission_id = ? AND observer_idx = ? AND COALESCE(path_json, '') = COALESCE(?, '')
+			AND upstream_observation_id IS NULL`, txID, *observerIdx, data.PathJSON).Scan(&one) == nil
+	}
 	_, err = s.stmtInsertObservation.Exec(
 		txID, observerIdx, data.Direction,
 		data.SNR, data.RSSI, data.Score,
 		data.PathJSON, epochTs, nilIfEmpty(data.RawHex),
-		nilIfEmpty(resolvedJSON),
+		nilIfEmpty(resolvedJSON), nilIfEmpty(data.UpstreamObservationID),
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
-		log.Printf("[db] observation insert (non-fatal): %v", err)
+		return false, fmt.Errorf("insert observation: %w", err)
 	} else {
-		s.Stats.ObservationsInserted.Add(1)
+		data.ObservationInserted = !observationExisted
+		if data.ObservationInserted {
+			s.Stats.ObservationsInserted.Add(1)
+		}
 		// #1598: a resolved hop proves the node was forwarding traffic at
 		// rxTime. Refresh its last_seen so staleness/eviction logic sees
 		// relay activity, not just ADVERTs.
@@ -1212,7 +1289,8 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		// effective recency. Conditional `last_seen < ?` so we never go
 		// backwards on out-of-order ingest.
 		if _, err := s.stmtBumpTxLastSeen.Exec(epochTs, txID, epochTs); err != nil {
-			log.Printf("[db] tx last_seen bump (non-fatal): %v", err)
+			s.Stats.WriteErrors.Add(1)
+			return false, fmt.Errorf("update transmission last_seen: %w", err)
 		}
 	}
 
@@ -1315,6 +1393,10 @@ func (s *Store) UpsertObserver(id, name, iata string, meta *ObserverMeta) error 
 // message whose rxTime pre-dates the existing last_seen is a no-op for that
 // field, preventing offline observers from flashing as Online on reconnect.
 func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, lastSeen string) error {
+	return s.upsertObserverAtCount(id, name, iata, meta, lastSeen, 1)
+}
+
+func (s *Store) upsertObserverAtCount(id, name, iata string, meta *ObserverMeta, lastSeen string, count int) error {
 	ingestNow := time.Now().UTC().Format(time.RFC3339)
 	if lastSeen == "" {
 		lastSeen = ingestNow
@@ -1324,8 +1406,8 @@ func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, last
 	model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay := observerMetaColumns(meta)
 
 	_, err := s.stmtUpsertObserver.Exec(
-		id, name, normalizedIATA, lastSeen, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
-		name, normalizedIATA, ingestNow, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
+		id, name, normalizedIATA, lastSeen, lastSeen, count, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
+		name, normalizedIATA, ingestNow, lastSeen, count, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
@@ -1336,6 +1418,14 @@ func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, last
 	// Reactivate if this observer was previously marked inactive
 	s.db.Exec(`UPDATE observers SET inactive = 0 WHERE id = ? AND inactive = 1`, id)
 	return nil
+}
+
+func (s *Store) IncrementObserverPacketCount(id string) error {
+	_, err := s.db.Exec(`UPDATE observers SET packet_count = packet_count + 1 WHERE id = ?`, id)
+	if err != nil {
+		s.Stats.WriteErrors.Add(1)
+	}
+	return err
 }
 
 // UpsertObserverRetained applies the metadata from a RETAINED status message
@@ -2247,28 +2337,31 @@ func (s *Store) PruneDroppedPackets(retentionDays int) (int64, error) {
 
 // PacketData holds the data needed to insert a packet into the DB.
 type PacketData struct {
-	RawHex            string
-	Timestamp         string
-	ObserverID        string
-	ObserverName      string
-	SNR               *float64
-	RSSI              *float64
-	Score             *float64
-	Direction         *string
-	Hash              string
-	RouteType         int
-	PayloadType       int
-	PayloadVersion    int
-	PathJSON          string
-	DecodedJSON       string
-	ChannelHash       string // grouping key for channel queries (#762)
-	ScopeName         string // matched region name, or "" for unknown-scoped
-	IsTransportScoped bool   // true when route_type IN (0,3) AND Code1 ≠ "0000"
-	Code1             string // transport code 1 (scope), "" when the route carries none
-	Code2             string // transport code 2 (return-region hint), "" when absent
-	Region            string // observer region: payload > topic > source config (#788)
-	Foreign           bool   // true when ADVERT GPS lies outside configured geofilter (#730)
-	FromPubkey        string // pubkey of the originating node, for exact-match attribution (#1143)
+	RawHex                string
+	Timestamp             string
+	ObserverID            string
+	ObserverName          string
+	SNR                   *float64
+	RSSI                  *float64
+	Score                 *float64
+	Direction             *string
+	Hash                  string
+	RouteType             int
+	PayloadType           int
+	PayloadVersion        int
+	PathJSON              string
+	DecodedJSON           string
+	ChannelHash           string // grouping key for channel queries (#762)
+	ScopeName             string // matched region name, or "" for unknown-scoped
+	IsTransportScoped     bool   // true when route_type IN (0,3) AND Code1 ≠ "0000"
+	Code1                 string // transport code 1 (scope), "" when the route carries none
+	Code2                 string // transport code 2 (return-region hint), "" when absent
+	Region                string // observer region: payload > topic > source config (#788)
+	Foreign               bool   // true when ADVERT GPS lies outside configured geofilter (#730)
+	FromPubkey            string // pubkey of the originating node, for exact-match attribution (#1143)
+	PreserveTime          bool   // store Timestamp as packet/observation time (historical sources)
+	UpstreamObservationID string // stable UKMesh identity shared by Redis and PG sources
+	ObservationInserted   bool   // output: true only if this observation was newly accepted
 }
 
 // nilIfEmpty returns nil for empty strings (for nullable DB columns).
@@ -2480,6 +2573,11 @@ type MQTTPacketMessage struct {
 	Origin    string   `json:"origin"`
 	Region    string   `json:"region,omitempty"`    // optional region override (#788)
 	Timestamp string   `json:"timestamp,omitempty"` // observer receive time, resolved by handler
+	// PreserveTime stores Timestamp as the packet/observation time instead
+	// of the server ingest clock (#1370). Set by the handler from the
+	// source config (historical sources such as PostgresSource backfills);
+	// not parsed from the JSON envelope.
+	PreserveTime bool `json:"-"`
 }
 
 // BuildPacketData constructs a PacketData from a decoded packet and MQTT message.
@@ -2512,9 +2610,18 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		pathJSON = string(b)
 	}
 
+	// #1370 (counters #1233): live sources stamp server ingest time. A
+	// historical source (PreserveEnvelopeTime) keeps the resolved envelope
+	// time instead — stamping replayed history with the replay wall clock
+	// would collapse weeks of backfill onto one day.
+	pktTime := time.Now().UTC().Format(time.RFC3339)
+	if msg.PreserveTime && msg.Timestamp != "" {
+		pktTime = msg.Timestamp
+	}
+
 	pd := &PacketData{
 		RawHex:         msg.Raw,
-		Timestamp:      time.Now().UTC().Format(time.RFC3339), // #1370 (counters #1233)
+		Timestamp:      pktTime,
 		ObserverID:     observerID,
 		ObserverName:   msg.Origin,
 		SNR:            msg.SNR,
@@ -2527,6 +2634,7 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		PayloadVersion: decoded.Header.PayloadVersion,
 		PathJSON:       pathJSON,
 		DecodedJSON:    PayloadJSON(&decoded.Payload),
+		PreserveTime:   msg.PreserveTime,
 	}
 
 	// Region priority: payload field > topic-derived parameter (#788)

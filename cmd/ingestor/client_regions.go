@@ -73,7 +73,7 @@ func handleClientRegions(store *Store, cfg *Config, tag, rxPubkey string, msg ma
 	}
 	truncated, _ := msg["truncated"].(bool)
 
-	rxTime, _ := resolveRxTimeCore(msg, tag)
+	rxTime, _ := resolveRxTimeCore(msg, tag, 0)
 	observedAt := rxTime.Format(rxTimeMillisLayout)
 
 	var latPtr, lonPtr, posAccPtr *float64

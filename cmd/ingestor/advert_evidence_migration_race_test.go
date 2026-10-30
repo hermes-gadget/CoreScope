@@ -87,7 +87,7 @@ func TestAdvertRouteEvidenceLegacyCoalescedPathAndIndex(t *testing.T) {
 		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(detail, "SEARCH observations USING INDEX idx_observations_dedup") {
+		if strings.Contains(detail, "SEARCH observations USING INDEX idx_observations_dedup_legacy") {
 			indexed = true
 		}
 	}

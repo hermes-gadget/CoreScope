@@ -80,7 +80,7 @@ func handleClientPacket(store *Store, cfg *Config, tag, rxPubkey string, msg map
 	// the same timestamp and take its own independent time.Now() reading, so
 	// the coverage row and the observation for the SAME packet could straddle
 	// a second boundary on a fallback path.
-	rxTime, _ := resolveRxTimeCore(msg, tag)
+	rxTime, _ := resolveRxTimeCore(msg, tag, 0)
 	rxAt := rxTime.Format(time.RFC3339)
 	ingestedAt := time.Now().UTC().Format(time.RFC3339)
 	isAdvert := decoded.Header.PayloadTypeName == "ADVERT"
