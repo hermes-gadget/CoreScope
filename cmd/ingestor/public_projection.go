@@ -95,18 +95,23 @@ func (r publicProjectionRecord) participant() redisPendingEntry {
 // current generation is public. Rebuild never rewrites a mixed-source DB:
 // initialization requires an empty DB or an existing complete journal.
 type corePublicProjection struct {
-	mu            sync.Mutex
-	store         *Store
-	loadPolicy    func(context.Context) (*corePublicPolicy, error)
-	apply         func(*Store, publicProjectionRecord) error
-	retentionDays int
-	fingerprint   string // privacy-rule digest behind the last completed refresh
+	mu              sync.Mutex
+	store           *Store
+	loadPolicy      func(context.Context) (*corePublicPolicy, error)
+	apply           func(*Store, publicProjectionRecord) error
+	retentionDays   int
+	replayBatchSize int    // journal records applied per rebuild transaction
+	fingerprint     string // privacy-rule digest behind the last completed refresh
 }
 
 func newCorePublicProjection(store *Store, load func(context.Context) (*corePublicPolicy, error),
-	apply func(*Store, publicProjectionRecord) error, retentionDays int) (*corePublicProjection, error) {
+	apply func(*Store, publicProjectionRecord) error, retentionDays int, replayBatch ...int) (*corePublicProjection, error) {
 	if retentionDays < 1 {
 		return nil, errors.New("public projection requires positive packet retention")
+	}
+	batchSize := projectionReplayBatchSize(0)
+	if len(replayBatch) > 0 {
+		batchSize = projectionReplayBatchSize(replayBatch[0])
 	}
 	store.backfillWg.Wait()
 	var existing int
@@ -158,7 +163,8 @@ func newCorePublicProjection(store *Store, load func(context.Context) (*corePubl
 	// means the last writer completed and the tables match the journal. The
 	// old unconditional reset replayed the whole journal (~1h at production
 	// size) on every restart for no correctness gain.
-	return &corePublicProjection{store: store, loadPolicy: load, apply: apply, retentionDays: retentionDays}, nil
+	return &corePublicProjection{store: store, loadPolicy: load, apply: apply, retentionDays: retentionDays,
+		replayBatchSize: batchSize}, nil
 }
 
 func (p *corePublicProjection) Refresh(ctx context.Context) (int64, error) {
@@ -237,9 +243,11 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 	scopeMatchCounters.none.Store(0)
 	scopeMatchCounters.sinceUnix.Store(time.Now().Unix())
 	// Page the private journal rather than retaining all history in memory.
+	// Each page is one transaction, so a crash mid-page loses only that page
+	// and leaves ready=0 for a clean restart replay.
 	var cursor int64
 	for {
-		rows, err := p.store.db.Query(`SELECT id,record FROM public_projection_journal WHERE id>? ORDER BY id LIMIT ?`, cursor, publicProjectionReplayBatchSize)
+		rows, err := p.store.db.Query(`SELECT id,record FROM public_projection_journal WHERE id>? ORDER BY id LIMIT ?`, cursor, p.replayBatchSize)
 		if err != nil {
 			return err
 		}
@@ -247,7 +255,7 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 			id     int64
 			record publicProjectionRecord
 		}
-		batch := make([]saved, 0, publicProjectionReplayBatchSize)
+		batch := make([]saved, 0, p.replayBatchSize)
 		for rows.Next() {
 			var item saved
 			var raw []byte

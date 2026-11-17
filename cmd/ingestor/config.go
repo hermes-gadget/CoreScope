@@ -182,10 +182,17 @@ type MQTTLegacy struct {
 
 // Config holds the ingestor configuration, compatible with the Node.js config.json format.
 type Config struct {
-	PublicProjection bool         `json:"publicProjection,omitempty"`
-	DBPath           string       `json:"dbPath"`
-	MQTT             *MQTTLegacy  `json:"mqtt,omitempty"`
-	MQTTSources      []MQTTSource `json:"mqttSources,omitempty"`
+	PublicProjection bool `json:"publicProjection,omitempty"`
+
+	// PublicProjectionReplayBatchSize caps how many journal records one
+	// rebuild transaction applies. 0/unset selects 500; values are clamped
+	// to [1, 5000]. Larger pages amortise SQLite fsync but hold the single
+	// writer lock for longer.
+	PublicProjectionReplayBatchSize int `json:"publicProjectionReplayBatchSize,omitempty"`
+
+	DBPath      string       `json:"dbPath"`
+	MQTT        *MQTTLegacy  `json:"mqtt,omitempty"`
+	MQTTSources []MQTTSource `json:"mqttSources,omitempty"`
 	// PostgresSources read packets from an existing meshcore PostgreSQL /
 	// TimescaleDB deployment (backfill + follow) — see postgres_source.go.
 	PostgresSources []PostgresSource `json:"postgresSources,omitempty"`
@@ -523,6 +530,16 @@ func (c *Config) AnalysisLimit() int {
 		return c.DB.AnalysisLimit
 	}
 	return 10000
+}
+
+// PublicProjectionReplayBatch returns the number of journal records applied
+// per rebuild transaction. Unset selects the 500-record default; explicit
+// values are clamped to the supported range.
+func (c *Config) PublicProjectionReplayBatch() int {
+	if c == nil {
+		return projectionReplayBatchSize(0)
+	}
+	return projectionReplayBatchSize(c.PublicProjectionReplayBatchSize)
 }
 
 // ShouldValidateSignatures returns true (default) unless explicitly disabled.

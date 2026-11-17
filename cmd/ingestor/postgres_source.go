@@ -148,6 +148,17 @@ FROM ingest_observation_ledger WHERE observed_at >= $1`
 	return query, args
 }
 
+// pgPolicyCursor advances the ledger cursor across projection policy changes.
+// A generation bump alone (FK-cascade node deletes, zero-row statements) does
+// not change visibility, so the cursor is kept. Only a changed privacy-rule
+// fingerprint — the prefix set actually widened or narrowed — seeks back.
+// The seek lands on MIN(seq)-1 for rows at/after the packet retention cutoff,
+// never 0: older rows are pruned from the derived store anyway, so replaying
+// the full multi-million-row ledger bought no correctness. When no retained
+// row matches, the seek returns the current tail so future committed rows
+// still pass. A first-generation/legacy state (empty fingerprint) adopts the
+// baseline instead of replaying; that preserves upgrade behaviour, not a
+// policy change.
 func pgPolicyCursor(state pgSourceState, generation int64, fingerprint string, cutoff time.Time,
 	seek func(time.Time) (int64, error)) (pgSourceState, error) {
 	if state.PolicyGeneration != generation {
@@ -431,8 +442,18 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 			// The ledger cursor walks seq order; "follow from now" must start
 			// at the current tail, not replay the committed history.
 			if qerr := db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM ingest_observation_ledger`).Scan(&state.LastSeq); qerr != nil {
-				log.Printf("[pg:%s] ERROR: resolving ledger tail: %v", tag, qerr)
-				state.LastSeq = 0
+				// Never fall back to seq 0: that re-reads the whole ledger at
+				// ~34 rows/s (a multi-day replay) for a query error. The
+				// retention floor bounds the catch-up to rows this deployment
+				// may still publish. If even that fails, disable the source
+				// rather than silently start an unbounded replay.
+				cutoff := time.Now().UTC().AddDate(0, 0, -cfg.Retention.PacketDays)
+				query, args := buildPgRetentionCursorQuery(src, cutoff)
+				if ferr := db.QueryRow(query, args...).Scan(&state.LastSeq); ferr != nil {
+					log.Printf("[pg:%s] ERROR: resolving ledger tail: %v; retention floor: %v — source disabled", tag, qerr, ferr)
+					return
+				}
+				log.Printf("[pg:%s] WARN: ledger tail unavailable (%v); starting at retention floor seq %d", tag, qerr, state.LastSeq)
 			} else {
 				log.Printf("[pg:%s] following from ledger seq %d", tag, state.LastSeq)
 			}
