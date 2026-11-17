@@ -221,7 +221,7 @@ func main() {
 			func(target *Store, record publicProjectionRecord) error {
 				return handleMessage(target, record.Tag, record.Source,
 					&pgMessage{topic: record.Topic, payload: record.Payload, obsID: record.ObservationID}, keySet.Snapshot(), regionSet, cfg)
-			}, cfg.Retention.PacketDays)
+			}, cfg.Retention.PacketDays, cfg.PublicProjectionReplayBatch())
 		if err != nil {
 			log.Fatalf("public projection: %v", err)
 		}

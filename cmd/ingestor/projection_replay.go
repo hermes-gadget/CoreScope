@@ -18,7 +18,24 @@ type ingestSQL interface {
 	Prepare(string) (*sql.Stmt, error)
 }
 
-const publicProjectionReplayBatchSize = 256
+const (
+	// publicProjectionReplayBatchDefault is one SQLite transaction's worth of
+	// journal records during a rebuild. 500 amortises fsync across records
+	// while keeping a page short enough that live ingest is not starved.
+	publicProjectionReplayBatchDefault = 500
+	// publicProjectionReplayBatchMax bounds a single replay transaction. A
+	// much larger page would hold writerMu long enough to stall live ingest.
+	publicProjectionReplayBatchMax = 5000
+)
+
+// projectionReplayBatchSize normalises a configured replay page size.
+// Zero/unset selects the default; negative and oversized values clamp.
+func projectionReplayBatchSize(configured int) int {
+	if configured <= 0 {
+		return publicProjectionReplayBatchDefault
+	}
+	return min(configured, publicProjectionReplayBatchMax)
+}
 
 // withProjectionReplayTx lends a transaction-scoped Store to the existing
 // decoder. The original Store and its prepared statements are never swapped,

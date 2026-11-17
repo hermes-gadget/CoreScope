@@ -44,7 +44,7 @@ func TestProjectionReplayCrashWorker(t *testing.T) {
 		if err := applyReplayFixture(target, record); err != nil {
 			return err
 		}
-		if record.ObservationID == "00000000-0000-4000-8000-000000000258" {
+		if record.ObservationID == "00000000-0000-4000-8000-000000000501" {
 			if err := os.WriteFile(fixture.Marker, []byte("inside uncommitted page two"), 0o600); err != nil {
 				return err
 			}
@@ -128,7 +128,7 @@ func TestProjectionReplayProcessCrashKeepsCursorAndRecovers(t *testing.T) {
 	}
 	defer store.Close()
 	var observations, ready int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&observations); err != nil || observations != 256 {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&observations); err != nil || observations != 500 {
 		t.Fatalf("crash exposed a partial page: observations=%d err=%v", observations, err)
 	}
 	if err := store.db.QueryRow(`SELECT ready FROM public_projection_state`).Scan(&ready); err != nil || ready != 0 {
@@ -253,7 +253,7 @@ func TestProjectionReplayRollsBackWholePageAndRecovers(t *testing.T) {
 		return nil
 	}
 	load := func(context.Context) (*corePublicPolicy, error) { return policy, nil }
-	projection, err := newCorePublicProjection(store, load, apply, 30)
+	projection, err := newCorePublicProjection(store, load, apply, 30, 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestProjectionReplayRollsBackWholePageAndRecovers(t *testing.T) {
 	// Page two must roll back both derived writes and private journal deletion.
 	assertCounts(256, 515, 0)
 	fail = false
-	projection, err = newCorePublicProjection(store, load, apply, 30)
+	projection, err = newCorePublicProjection(store, load, apply, 30, 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,12 +309,90 @@ func TestProjectionReplayRollsBackWholePageAndRecovers(t *testing.T) {
 	projection, err = newCorePublicProjection(store, load, func(*Store, publicProjectionRecord) error {
 		t.Fatal("completed projection was replayed on restart")
 		return nil
-	}, 30)
+	}, 30, 256)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := projection.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProjectionReplayConfigurablePageSize(t *testing.T) {
+	resetScopeMatchCounters(t)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "replay-pages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	policy := &corePublicPolicy{generation: 1, fingerprint: "initial"}
+	projection, err := newCorePublicProjection(store,
+		func(context.Context) (*corePublicPolicy, error) { return policy, nil }, applyReplayFixture, 30, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projection.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	seedProjectionReplay(t, store, 515)
+	if _, err := store.db.Exec(`UPDATE public_projection_state SET ready=0`); err != nil {
+		t.Fatal(err)
+	}
+	before := store.Stats.WALCommits.Load()
+	if _, err := projection.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// 515 records at 100 per transaction: five full pages and one of 15.
+	if commits := store.Stats.WALCommits.Load() - before; commits != 6 {
+		t.Fatalf("replayed 515 records in %d commits, want 6 pages of at most 100", commits)
+	}
+	for _, check := range []struct {
+		query string
+		want  int
+	}{
+		{`SELECT COUNT(*) FROM observations`, 515},
+		{`SELECT COUNT(*) FROM public_projection_journal`, 515},
+		{`SELECT ready FROM public_projection_state`, 1},
+	} {
+		var got int
+		if err := store.db.QueryRow(check.query).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != check.want {
+			t.Fatalf("%s = %d, want %d", check.query, got, check.want)
+		}
+	}
+	var packets int
+	if err := store.db.QueryRow(`SELECT packet_count FROM observers WHERE id='replay-fixture'`).Scan(&packets); err != nil || packets != 515 {
+		t.Fatalf("observer packet count=%d err=%v, want 515", packets, err)
+	}
+}
+
+func TestProjectionReplayBatchSizeNormalisation(t *testing.T) {
+	for _, tc := range []struct {
+		configured int
+		want       int
+	}{
+		{0, publicProjectionReplayBatchDefault},
+		{-1, publicProjectionReplayBatchDefault},
+		{1, 1},
+		{500, 500},
+		{publicProjectionReplayBatchMax + 1, publicProjectionReplayBatchMax},
+	} {
+		if got := projectionReplayBatchSize(tc.configured); got != tc.want {
+			t.Fatalf("projectionReplayBatchSize(%d) = %d, want %d", tc.configured, got, tc.want)
+		}
+		cfg := &Config{PublicProjectionReplayBatchSize: tc.configured}
+		if got := cfg.PublicProjectionReplayBatch(); got != tc.want {
+			t.Fatalf("Config.PublicProjectionReplayBatch() with %d = %d, want %d", tc.configured, got, tc.want)
+		}
+	}
+	var nilConfig *Config
+	if got := nilConfig.PublicProjectionReplayBatch(); got != publicProjectionReplayBatchDefault {
+		t.Fatalf("nil Config batch = %d, want %d", got, publicProjectionReplayBatchDefault)
+	}
+	if publicProjectionReplayBatchDefault != 500 {
+		t.Fatalf("default replay batch = %d, want 500", publicProjectionReplayBatchDefault)
 	}
 }
 
